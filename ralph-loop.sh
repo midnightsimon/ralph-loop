@@ -90,6 +90,17 @@ DENIAL_PATTERN="Tool call was denied|tool use was rejected|allowedTools.*not ava
 # Wrapper: run claude with real-time denial detection and timeout.
 # Captures full output to .ralph-logs/. If a tool denial is detected in the
 # output stream, kills claude immediately and returns 1.
+#
+# Always uses --output-format stream-json internally so that output streams
+# line-by-line in real time (viewable with `tail -f`). Any --output-format
+# passed by the caller is stripped; the result event is extracted at the end
+# so callers that expect --output-format json still get a compatible object.
+#
+# Callers can set RALPH_DONE_PATTERN (regex) before calling. When the pattern
+# is found in the output, a grace timer starts (RALPH_DONE_GRACE seconds,
+# default 120). If Claude doesn't exit within the grace period, the process
+# is killed and the function returns success (the task was completed).
+#
 # Usage: run_claude [claude args...]
 run_claude() {
   mkdir -p "$LOG_DIR"
@@ -102,8 +113,27 @@ run_claude() {
 
   log "Claude output → ${outfile}"
 
-  # Run claude in the background so we can monitor its output
-  claude "$@" >"$outfile" 2>"$errfile" &
+  # Done-pattern detection (set by caller via RALPH_DONE_PATTERN)
+  local done_pattern="${RALPH_DONE_PATTERN:-}"
+  local done_grace="${RALPH_DONE_GRACE:-120}"
+  local done_detected_at=""
+
+  # Strip --output-format from caller args (we always use stream-json for
+  # real-time output). Remember the caller's preference for result extraction.
+  local caller_format=""
+  local args=()
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--output-format" ]]; then
+      caller_format="$2"
+      shift 2
+    else
+      args+=("$1")
+      shift
+    fi
+  done
+
+  # Run claude with stream-json so each event is flushed as a line in real time
+  claude "${args[@]}" --output-format stream-json >"$outfile" 2>"$errfile" &
   local pid=$!
   local start_time
   start_time=$(date +%s)
@@ -129,6 +159,28 @@ run_claude() {
       wait "$pid" 2>/dev/null || true
       return 1
     fi
+    # Check for done-pattern (e.g. PR created) and start grace countdown
+    if [[ -n "$done_pattern" && -z "$done_detected_at" ]]; then
+      if grep -qE "$done_pattern" "$outfile" 2>/dev/null; then
+        done_detected_at=$(date +%s)
+        log "Task completion detected — giving Claude ${done_grace}s to wrap up"
+      fi
+    fi
+    if [[ -n "$done_detected_at" ]]; then
+      local grace_elapsed=$(( $(date +%s) - done_detected_at ))
+      if [[ $grace_elapsed -ge $done_grace ]]; then
+        log "Grace period expired after ${done_grace}s — stopping Claude"
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null || true
+        # Extract result from stream even on grace-kill
+        local grace_result
+        grace_result=$(jq -c 'select(.type == "result")' "$outfile" 2>/dev/null | tail -1)
+        if [[ -n "$grace_result" ]]; then
+          echo "$grace_result"
+        fi
+        return 0
+      fi
+    fi
     sleep 2
   done
 
@@ -142,14 +194,22 @@ run_claude() {
       log "  → $line"
     done
     log "Add the missing tool to ALLOWED_TOOLS and re-run."
-    cat "$outfile"
     return 1
   fi
 
-  # Check for max turns reached (look for the specific CLI message, not arbitrary text)
+  # Check for max turns reached — look in text content and stream-json metadata
+  local max_turns_hit=false
   if grep -qE "reached the maximum number of turns|max_turns_reached|Maximum turns \([0-9]+\) reached" "$outfile" "$errfile" 2>/dev/null; then
+    max_turns_hit=true
+  elif jq -e 'select(.type == "result") | select(.stop_reason == "max_turns")' "$outfile" >/dev/null 2>&1; then
+    max_turns_hit=true
+  fi
+  if [[ "$max_turns_hit" == true ]]; then
     log "WARNING: Claude hit max turns limit — task may be incomplete"
-    cat "$outfile"
+    # Still extract result for callers
+    local mt_result
+    mt_result=$(jq -c 'select(.type == "result")' "$outfile" 2>/dev/null | tail -1)
+    [[ -n "$mt_result" ]] && echo "$mt_result"
     return 2
   fi
 
@@ -157,8 +217,18 @@ run_claude() {
     log "WARNING: Claude exited with code ${rc} — check ${outfile}"
   fi
 
-  # Output captured stdout for callers using $() to capture it
-  cat "$outfile"
+  # Extract the result event from the stream-json output.
+  # The result event has { "type": "result", "result": "...", ... } which is
+  # compatible with --output-format json, so callers using jq '.result' still work.
+  local result_line
+  result_line=$(jq -c 'select(.type == "result")' "$outfile" 2>/dev/null | tail -1)
+  if [[ -n "$result_line" ]]; then
+    echo "$result_line"
+  else
+    # Fallback: no result event found — output raw stream for debugging
+    log "WARNING: No result event found in stream output"
+    cat "$outfile"
+  fi
   return $rc
 }
 
@@ -468,6 +538,11 @@ for s in starts:
   # ── Phase 2: Implement ──────────────────────────────────────────────────
   log "Phase 2: Implementing issue #${issue_number}..."
 
+  # Detect PR creation in output and give Claude 120s to wrap up before killing.
+  # gh pr create outputs a URL like https://github.com/owner/repo/pull/123
+  export RALPH_DONE_PATTERN="github\\.com/.*/pull/[0-9]"
+  export RALPH_DONE_GRACE=120
+
   local phase2_rc=0
   run_claude -p "You are implementing GitHub issue #${issue_number}.
 
@@ -516,10 +591,14 @@ You are running in a fully automated headless pipeline with NO human present.
 - Execute ALL git commands directly (commit, push, etc.) without hesitation
 - Execute ALL gh commands directly (pr create, pr merge, etc.) without hesitation
 - If something fails, try to fix it — do not stop and ask for guidance
-- There is nobody to respond to your questions — just act" \
+- There is nobody to respond to your questions — just act
+- Once you have created the PR, you are DONE. Do not review your own PR, do not do additional cleanup, do not run more tests. Just stop." \
     --model "$MODEL" \
     --max-turns "$MAX_TURNS" \
     --allowedTools "$ALLOWED_TOOLS" || phase2_rc=$?
+
+  # Clear done-pattern so it doesn't affect subsequent run_claude calls
+  unset RALPH_DONE_PATTERN RALPH_DONE_GRACE
 
   if [[ $phase2_rc -eq 2 ]]; then
     skip_issue "$issue_number" "hit max turns during implementation"
