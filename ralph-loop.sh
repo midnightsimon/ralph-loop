@@ -12,6 +12,7 @@ Bash(cmake *),Bash(cd *),Bash(ls *),Bash(mkdir *),Bash(rm *)"
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 COUNT=1
+COUNT_EXPLICIT=false
 DRY_RUN=false
 MODEL="opus"
 MAX_TURNS=75
@@ -23,7 +24,7 @@ ISSUE_LIST=""  # comma-separated issue numbers
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --count)
-      COUNT="$2"; shift 2 ;;
+      COUNT="$2"; COUNT_EXPLICIT=true; shift 2 ;;
     --dry-run)
       DRY_RUN=true; shift ;;
     --model)
@@ -82,7 +83,9 @@ skip_issue() {
 # Denial patterns to scan for in Claude's output.
 # When Claude tries a tool not on the allowlist, the CLI rejects it and the
 # model's response will mention the denial. We detect that and abort early.
-DENIAL_PATTERN="tool.*denied|not.*allowed|permission.*denied|tool.*not available|rejected tool|tool.*blocked"
+# Tighter patterns anchored to CLI-specific denial messages to avoid false
+# positives from code/comments that Claude reads or outputs.
+DENIAL_PATTERN="Tool call was denied|tool use was rejected|allowedTools.*not available|tool is not allowed|rejected tool call|tool was blocked by policy"
 
 # Wrapper: run claude with real-time denial detection and timeout.
 # Captures full output to .ralph-logs/. If a tool denial is detected in the
@@ -116,9 +119,9 @@ run_claude() {
       log "Check ${outfile} for partial output"
       return 1
     fi
-    if grep -qiE "$DENIAL_PATTERN" "$outfile" "$errfile" 2>/dev/null; then
+    if grep -qE "$DENIAL_PATTERN" "$outfile" "$errfile" 2>/dev/null; then
       log "PERMISSION DENIED — Claude needs a tool not on the allowlist. Aborting."
-      grep -hiE "$DENIAL_PATTERN" "$outfile" "$errfile" 2>/dev/null | head -5 | while IFS= read -r line; do
+      grep -hE "$DENIAL_PATTERN" "$outfile" "$errfile" 2>/dev/null | head -5 | while IFS= read -r line; do
         log "  → $line"
       done
       log "Add the missing tool to ALLOWED_TOOLS and re-run."
@@ -129,23 +132,23 @@ run_claude() {
     sleep 2
   done
 
-  wait "$pid" 2>/dev/null || true
-  local rc=$?
+  local rc=0
+  wait "$pid" 2>/dev/null || rc=$?
 
   # Post-completion check (catches denials in buffered/json output)
-  if grep -qiE "$DENIAL_PATTERN" "$outfile" "$errfile" 2>/dev/null; then
+  if grep -qE "$DENIAL_PATTERN" "$outfile" "$errfile" 2>/dev/null; then
     log "PERMISSION DENIED detected in completed output:"
-    grep -hiE "$DENIAL_PATTERN" "$outfile" "$errfile" 2>/dev/null | head -5 | while IFS= read -r line; do
+    grep -hE "$DENIAL_PATTERN" "$outfile" "$errfile" 2>/dev/null | head -5 | while IFS= read -r line; do
       log "  → $line"
     done
     log "Add the missing tool to ALLOWED_TOOLS and re-run."
+    cat "$outfile"
     return 1
   fi
 
-  # Check for max turns reached
-  if grep -qiE "max turns|maximum.*turns|reached.*turns" "$outfile" "$errfile" 2>/dev/null; then
+  # Check for max turns reached (look for the specific CLI message, not arbitrary text)
+  if grep -qE "reached the maximum number of turns|max_turns_reached|Maximum turns \([0-9]+\) reached" "$outfile" "$errfile" 2>/dev/null; then
     log "WARNING: Claude hit max turns limit — task may be incomplete"
-    # Return code 2 to signal max turns (callers can check this)
     cat "$outfile"
     return 2
   fi
@@ -257,9 +260,15 @@ You are running in a fully automated headless pipeline with NO human present.
     local pr_branch
     pr_branch=$(gh pr view "$pr_number" --json headRefName -q .headRefName 2>/dev/null || echo "")
     if [[ -n "$pr_branch" ]]; then
-      # Remove any worktree using this branch
-      local worktree_path
-      worktree_path=$(git worktree list --porcelain | grep -B2 "branch refs/heads/${pr_branch}" | grep "^worktree " | sed 's/^worktree //' || echo "")
+      # Remove any worktree using this branch.
+      # Parse porcelain output by reading stanzas (blank-line separated) to
+      # avoid fragile grep -B2 which can include "--" separators.
+      local worktree_path=""
+      worktree_path=$(git worktree list --porcelain 2>/dev/null | awk -v branch="branch refs/heads/${pr_branch}" '
+        /^worktree / { wt = substr($0, 10) }
+        $0 == branch { print wt; exit }
+        /^$/ { wt = "" }
+      ' || echo "")
       if [[ -n "$worktree_path" ]]; then
         log "Cleaning up worktree: ${worktree_path}"
         git worktree remove "$worktree_path" --force 2>/dev/null || true
@@ -270,8 +279,9 @@ You are running in a fully automated headless pipeline with NO human present.
         fi
       fi
       # Also check .worktrees/ for a directory matching the branch suffix
-      # (handles cases where git no longer tracks the worktree but the folder remains)
-      local wt_dir="${REPO_ROOT}/.worktrees/${pr_branch#*/}"
+      # (handles cases where git no longer tracks the worktree but the folder remains).
+      # Use ## to strip the longest prefix up to '/', so feature/foo/bar → bar.
+      local wt_dir="${REPO_ROOT}/.worktrees/${pr_branch##*/}"
       if [[ -d "$wt_dir" ]]; then
         log "Removing worktree directory: ${wt_dir}"
         git worktree remove "$wt_dir" --force 2>/dev/null || true
@@ -372,22 +382,56 @@ Output ONLY the JSON object, no other text." \
     fi
   fi
 
-  # Try 3: Find first { ... } substring that parses as JSON with "relevant" key
+  # Try 3: Find first { ... } substring that parses as JSON with "relevant" key.
+  # Uses a brace-depth counter to find candidate objects in O(n) time instead
+  # of the previous O(n^3) brute-force approach.
   if [[ -z "$parsed_json" ]]; then
     parsed_json=$(python3 -c "
 import json, sys
 text = sys.stdin.read()
-start = text.find('{')
-while start != -1:
-    for end in range(len(text), start, -1):
-        try:
-            obj = json.loads(text[start:end])
-            if 'relevant' in obj:
-                print(json.dumps(obj))
-                sys.exit(0)
-        except:
-            pass
-    start = text.find('{', start + 1)
+# Collect start positions of top-level '{' candidates
+starts = []
+i = 0
+while True:
+    i = text.find('{', i)
+    if i == -1:
+        break
+    starts.append(i)
+    i += 1
+
+for s in starts:
+    # Walk forward tracking brace depth to find the matching '}'
+    depth = 0
+    in_str = False
+    escape = False
+    for j in range(s, len(text)):
+        c = text[j]
+        if escape:
+            escape = False
+            continue
+        if c == '\\\\':
+            if in_str:
+                escape = True
+            continue
+        if c == '\"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                candidate = text[s:j+1]
+                try:
+                    obj = json.loads(candidate)
+                    if isinstance(obj, dict) and 'relevant' in obj:
+                        print(json.dumps(obj))
+                        sys.exit(0)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                break
 " <<< "$result_text" 2>/dev/null || true)
   fi
 
@@ -490,7 +534,7 @@ if [[ -n "$ISSUE_LIST" ]]; then
   IFS=',' read -ra ISSUE_QUEUE <<< "$ISSUE_LIST"
   # Default COUNT to 2x the number of issues (implement + review each)
   # Only auto-adjust if the user didn't explicitly set --count
-  if [[ "$COUNT" -eq 1 && "${#ISSUE_QUEUE[@]}" -ge 1 ]]; then
+  if [[ "$COUNT_EXPLICIT" == false && "${#ISSUE_QUEUE[@]}" -ge 1 ]]; then
     COUNT=$(( ${#ISSUE_QUEUE[@]} * 2 ))
   fi
 fi
@@ -508,7 +552,11 @@ for ((i = 1; i <= COUNT; i++)); do
   if [[ "${#ISSUE_QUEUE[@]}" -gt 0 ]]; then
     # Pop first issue from the queue
     issue="${ISSUE_QUEUE[0]}"
-    ISSUE_QUEUE=("${ISSUE_QUEUE[@]:1}")
+    if [[ "${#ISSUE_QUEUE[@]}" -le 1 ]]; then
+      ISSUE_QUEUE=()
+    else
+      ISSUE_QUEUE=("${ISSUE_QUEUE[@]:1}")
+    fi
     # Trim whitespace
     issue="${issue// /}"
     if [[ -n "$issue" ]]; then
