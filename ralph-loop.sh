@@ -132,8 +132,9 @@ run_claude() {
     fi
   done
 
-  # Run claude with stream-json so each event is flushed as a line in real time
-  claude "${args[@]}" --output-format stream-json >"$outfile" 2>"$errfile" &
+  # Run claude with stream-json so each event is flushed as a line in real time.
+  # --verbose is required by the CLI when using stream-json with --print.
+  claude "${args[@]}" --verbose --output-format stream-json >"$outfile" 2>"$errfile" &
   local pid=$!
   local start_time
   start_time=$(date +%s)
