@@ -301,7 +301,8 @@ for raw_line in sys.stdin:
 f.close()
 PYFORMAT
 
-  tail -f "$raw_file" 2>/dev/null | python3 -u "$_FORMATTER_SCRIPT" "$live_file" &
+  # Subshell so we can kill the entire process group (tail + python3)
+  (tail -f "$raw_file" 2>/dev/null | python3 -u "$_FORMATTER_SCRIPT" "$live_file") &
   FORMATTER_PID=$!
 }
 
@@ -351,7 +352,8 @@ run_claude() {
   # Helper to kill the formatter on any exit path
   _kill_formatter() {
     if [[ -n "${FORMATTER_PID:-}" ]]; then
-      kill "$FORMATTER_PID" 2>/dev/null
+      # Kill entire process group (subshell + tail + python3)
+      kill -- -"$FORMATTER_PID" 2>/dev/null || kill "$FORMATTER_PID" 2>/dev/null || true
       wait "$FORMATTER_PID" 2>/dev/null || true
       FORMATTER_PID=""
     fi
