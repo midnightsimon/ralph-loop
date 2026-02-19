@@ -92,6 +92,218 @@ skip_issue() {
   fi
 }
 
+# ── ANSI Colors (matching Claude Code's agent team palette) ──────────────────
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
+C_LEAD='\033[1;37m'       # Bold white
+C_RESEARCHER='\033[0;36m' # Cyan
+C_IMPLEMENTER='\033[0;32m' # Green
+C_TESTER='\033[0;33m'      # Yellow
+C_SECURITY='\033[0;31m'    # Red
+C_QUALITY='\033[0;34m'     # Blue
+C_ARCHITECT='\033[0;35m'   # Magenta
+C_TOOL='\033[2;37m'        # Dim white
+C_MSG='\033[0;96m'         # Light cyan (inter-agent messages)
+
+# Start the live stream formatter as a background process.
+# Tails the raw stream-json log and writes color-coded output to a .live file.
+#
+# Usage: start_live_formatter <raw_outfile> <live_outfile>
+#        Sets FORMATTER_PID for the caller to kill later.
+start_live_formatter() {
+  local raw_file="$1"
+  local live_file="$2"
+
+  tail -f "$raw_file" 2>/dev/null | python3 -u - "$live_file" <<'PYFORMAT' &
+import sys, json, os, time
+from datetime import datetime
+
+live_file = sys.argv[1] if len(sys.argv) > 1 else "/dev/stdout"
+f = open(live_file, "w", buffering=1)  # line-buffered
+
+# ANSI color codes
+RESET   = "\033[0m"
+BOLD    = "\033[1m"
+DIM     = "\033[2m"
+COLORS  = {
+    "lead":         "\033[1;37m",   # Bold white
+    "researcher":   "\033[0;36m",   # Cyan
+    "implementer":  "\033[0;32m",   # Green
+    "tester":       "\033[0;33m",   # Yellow
+    "security":     "\033[0;31m",   # Red
+    "quality":      "\033[0;34m",   # Blue
+    "architect":    "\033[0;35m",   # Magenta
+    "unknown":      "\033[2;37m",   # Dim
+}
+TOOL_COLOR = "\033[2;37m"
+MSG_COLOR  = "\033[0;96m"
+
+# Role detection keywords
+ROLE_KEYWORDS = {
+    "researcher":   ["researcher", "research"],
+    "implementer":  ["implementer", "implement"],
+    "tester":       ["tester", "test-runner", "test_runner"],
+    "security":     ["security", "security-reviewer", "security_reviewer"],
+    "quality":      ["quality", "quality-reviewer", "quality_reviewer"],
+    "architect":    ["architecture", "architect", "architecture-reviewer"],
+}
+
+# Track session/agent mapping
+session_to_role = {}
+current_agent = "lead"
+task_spawns = {}  # task description -> expected role
+
+def detect_role(name_or_desc):
+    """Match a name/description to a known role."""
+    if not name_or_desc:
+        return None
+    lower = name_or_desc.lower()
+    for role, keywords in ROLE_KEYWORDS.items():
+        for kw in keywords:
+            if kw in lower:
+                return role
+    return None
+
+def get_color(role):
+    return COLORS.get(role, COLORS["unknown"])
+
+def fmt_time():
+    return datetime.now().strftime("%H:%M:%S")
+
+def pad_role(role, width=14):
+    return role.ljust(width)
+
+def emit(role, icon, text):
+    color = get_color(role)
+    label = pad_role(role.capitalize())
+    line = f"{DIM}{fmt_time()}{RESET} {color}{label}{RESET} {icon} {text}"
+    f.write(line + "\n")
+
+def truncate(s, maxlen=120):
+    s = s.replace("\n", " ").strip()
+    return (s[:maxlen] + "...") if len(s) > maxlen else s
+
+for raw_line in sys.stdin:
+    raw_line = raw_line.strip()
+    if not raw_line:
+        continue
+    try:
+        evt = json.loads(raw_line)
+    except (json.JSONDecodeError, ValueError):
+        continue
+
+    evt_type = evt.get("type", "")
+
+    # ── Result event (final) ─────────────────────────────────────────
+    if evt_type == "result":
+        stop = evt.get("stop_reason", "end_turn")
+        emit("lead", BOLD + "=" + RESET, f"Session ended (reason: {stop})")
+        continue
+
+    # ── System events ────────────────────────────────────────────────
+    if evt_type == "system":
+        text = evt.get("text", evt.get("message", ""))
+        if text:
+            emit("lead", DIM + "i" + RESET, truncate(str(text)))
+        continue
+
+    # ── Assistant message (text + tool_use) ──────────────────────────
+    if evt_type == "assistant":
+        msg = evt.get("message", evt)
+        content_blocks = msg.get("content", [])
+        # Check for agent/session identification
+        agent_name = (evt.get("agent_name") or evt.get("agent")
+                      or evt.get("session_name") or msg.get("agent_name")
+                      or msg.get("agent") or "")
+        if agent_name:
+            role = detect_role(agent_name) or "unknown"
+            session_to_role[agent_name] = role
+            current_agent = role
+        for block in content_blocks:
+            if isinstance(block, str):
+                emit(current_agent, " ", truncate(block))
+            elif isinstance(block, dict):
+                btype = block.get("type", "")
+                if btype == "text":
+                    text = block.get("text", "")
+                    if text.strip():
+                        # Check for SendMessage patterns
+                        if "SendMessage" in text or "sending message" in text.lower():
+                            emit(current_agent, MSG_COLOR + ">" + RESET, truncate(text))
+                        else:
+                            for line in text.strip().split("\n")[:3]:
+                                if line.strip():
+                                    emit(current_agent, " ", truncate(line))
+                elif btype == "tool_use":
+                    tool_name = block.get("name", "?")
+                    tool_input = block.get("input", {})
+                    # Detect Task spawns (new teammates)
+                    if tool_name == "Task":
+                        desc = tool_input.get("description", "")
+                        name = tool_input.get("name", "")
+                        role = detect_role(name) or detect_role(desc) or "unknown"
+                        if name:
+                            session_to_role[name] = role
+                        emit(current_agent, BOLD + "+" + RESET,
+                             f"Spawning teammate: {get_color(role)}{name or desc}{RESET}")
+                    elif tool_name == "SendMessage":
+                        recipient = tool_input.get("recipient", "?")
+                        summary = tool_input.get("summary", "")
+                        msg_type = tool_input.get("type", "message")
+                        emit(current_agent, MSG_COLOR + ">" + RESET,
+                             f"{msg_type} to {recipient}: {summary}")
+                    elif tool_name in ("TaskCreate", "TaskUpdate", "TaskList", "TaskGet"):
+                        subj = tool_input.get("subject", "")
+                        status = tool_input.get("status", "")
+                        detail = subj or status or ""
+                        emit(current_agent, BOLD + "#" + RESET,
+                             f"{tool_name}: {truncate(detail)}" if detail else tool_name)
+                    elif tool_name == "Bash":
+                        cmd = tool_input.get("command", "")
+                        emit(current_agent, TOOL_COLOR + "$" + RESET, truncate(cmd, 100))
+                    elif tool_name in ("Read", "Glob", "Grep"):
+                        path = (tool_input.get("file_path", "")
+                                or tool_input.get("pattern", "")
+                                or tool_input.get("path", ""))
+                        emit(current_agent, TOOL_COLOR + "@" + RESET, f"{tool_name}: {path}")
+                    elif tool_name in ("Edit", "Write"):
+                        path = tool_input.get("file_path", "")
+                        emit(current_agent, BOLD + "*" + RESET, f"{tool_name}: {path}")
+                    else:
+                        emit(current_agent, TOOL_COLOR + "~" + RESET, tool_name)
+        continue
+
+    # ── Tool result ──────────────────────────────────────────────────
+    if evt_type == "tool_result" or evt_type == "tool":
+        # Brief confirmation of tool completion
+        content = evt.get("content", evt.get("result", ""))
+        if isinstance(content, list):
+            content = " ".join(
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        content = str(content)
+        # Only show errors or short results
+        if "error" in content.lower() or "failed" in content.lower():
+            emit(current_agent, "\033[31m!" + RESET, truncate(content, 200))
+        continue
+
+    # ── Content block delta (streaming text) ─────────────────────────
+    if evt_type == "content_block_delta":
+        delta = evt.get("delta", {})
+        text = delta.get("text", "")
+        # Skip small deltas, accumulate would be complex — just show substantial ones
+        if len(text) > 40:
+            emit(current_agent, " ", truncate(text))
+        continue
+
+f.close()
+PYFORMAT
+
+  FORMATTER_PID=$!
+}
+
 # Denial patterns to scan for in Claude's output.
 DENIAL_PATTERN="Tool call was denied|tool use was rejected|allowedTools.*not available|tool is not allowed|rejected tool call|tool was blocked by policy"
 
@@ -106,7 +318,15 @@ run_claude() {
   : > "$outfile"
   : > "$errfile"
 
+  local livefile="${LOG_DIR}/${ts}.live"
+  : > "$livefile"
+
   log "Claude output → ${outfile}"
+  log "Live view    → ${livefile}  (tail -f ${livefile})"
+
+  # Start the live stream formatter
+  FORMATTER_PID=""
+  start_live_formatter "$outfile" "$livefile"
 
   # Done-pattern detection (set by caller via RALPH_DONE_PATTERN)
   local done_pattern="${RALPH_DONE_PATTERN:-}"
@@ -127,6 +347,15 @@ run_claude() {
     fi
   done
 
+  # Helper to kill the formatter on any exit path
+  _kill_formatter() {
+    if [[ -n "${FORMATTER_PID:-}" ]]; then
+      kill "$FORMATTER_PID" 2>/dev/null
+      wait "$FORMATTER_PID" 2>/dev/null || true
+      FORMATTER_PID=""
+    fi
+  }
+
   # Run claude with stream-json so each event is flushed as a line in real time.
   # --verbose is required by the CLI when using stream-json with --print.
   claude "${args[@]}" --verbose --output-format stream-json >"$outfile" 2>"$errfile" &
@@ -142,6 +371,7 @@ run_claude() {
       log "ERROR: Claude timed out after ${TIMEOUT}s — killing process"
       kill "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null || true
+      _kill_formatter
       log "Check ${outfile} for partial output"
       return 1
     fi
@@ -153,6 +383,7 @@ run_claude() {
       log "Add the missing tool to ALLOWED_TOOLS and re-run."
       kill "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null || true
+      _kill_formatter
       return 1
     fi
     # Check for done-pattern (e.g. PR created) and start grace countdown
@@ -168,6 +399,7 @@ run_claude() {
         log "Grace period expired after ${done_grace}s — stopping Claude"
         kill "$pid" 2>/dev/null
         wait "$pid" 2>/dev/null || true
+        _kill_formatter
         # Extract result from stream even on grace-kill
         local grace_result
         grace_result=$(jq -c 'select(.type == "result")' "$outfile" 2>/dev/null | tail -1)
@@ -182,6 +414,10 @@ run_claude() {
 
   local rc=0
   wait "$pid" 2>/dev/null || rc=$?
+
+  # Give formatter a moment to process final events, then stop it
+  sleep 1
+  _kill_formatter
 
   # Post-completion check (catches denials in buffered/json output)
   if grep -qE "$DENIAL_PATTERN" "$outfile" "$errfile" 2>/dev/null; then
@@ -291,7 +527,7 @@ All code changes MUST happen in this worktree directory.
 
 Create an agent team with these teammates:
 
-1. **Researcher** — Use Sonnet. Explore the codebase to understand the relevant
+1. **Researcher** — Use Opus. Explore the codebase to understand the relevant
    files, patterns, dependencies, and test conventions. Write findings to a
    summary. Focus on: what files need changing, what patterns to follow, what
    tests exist. Do NOT modify any files.
@@ -300,7 +536,7 @@ Create an agent team with these teammates:
    the changes in the worktree. Follow the implementation plan. Use conventional
    commits (feat:, fix:, refactor:, etc.). Commit often.
 
-3. **Tester** — Use Sonnet. Wait for the Implementer to finish, then run the
+3. **Tester** — Use Opus. Wait for the Implementer to finish, then run the
    test suite. If tests fail, message the Implementer with the failures so they
    can fix them. Iterate until tests pass. Run:
    - npm -w @typeblazer/web run test:unit
@@ -339,14 +575,14 @@ You are the team lead for reviewing PR #${pr_number}.
 
 Create an agent team to review this PR. Spawn three reviewers:
 
-1. **Security Reviewer** (Haiku) — Focus on security implications, input
+1. **Security Reviewer** (Opus) — Focus on security implications, input
    validation, injection risks, authentication/authorization issues, and
    sensitive data handling.
 
-2. **Quality Reviewer** (Sonnet) — Check code quality, test coverage,
+2. **Quality Reviewer** (Opus) — Check code quality, test coverage,
    convention adherence, error handling, and edge cases.
 
-3. **Architecture Reviewer** (Haiku) — Evaluate design decisions, performance
+3. **Architecture Reviewer** (Opus) — Evaluate design decisions, performance
    implications, maintainability, and consistency with the existing codebase.
 
 ## Your Role as Lead
