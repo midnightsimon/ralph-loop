@@ -541,8 +541,6 @@ Create an agent team with these teammates:
    - npm -w @typeblazer/api run test
    - npm run lint
 
-Require plan approval for the Implementer before they start coding.
-
 ## Your Role as Lead
 
 1. Spawn the teammates above
@@ -560,6 +558,8 @@ You are running in a fully automated headless pipeline with NO human present.
 - Execute ALL commands directly without hesitation
 - If something fails, try to fix it — do not stop and ask
 - There is nobody to respond to your questions — just act
+- Do NOT use plan mode for teammates — they should start working immediately
+- NEVER use \`sleep\` or busy-wait loops to wait for teammates — messages are delivered automatically when teammates finish their turns
 PROMPT
 }
 
