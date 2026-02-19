@@ -747,10 +747,22 @@ for s in starts:
   local worktree_path="${REPO_ROOT}/.worktrees/${feature_name}"
 
   git fetch origin 2>/dev/null
-  git worktree add "$worktree_path" -b "feature/${feature_name}" origin/main 2>/dev/null || {
-    log "Failed to create worktree for issue #${issue_number}"
-    return
-  }
+
+  # Reuse existing worktree/branch from a previous attempt, or create new
+  if [[ -d "$worktree_path" ]]; then
+    log "Reusing existing worktree: ${worktree_path}"
+  elif git show-ref --verify --quiet "refs/heads/feature/${feature_name}" 2>/dev/null; then
+    # Branch exists but worktree was removed — re-add it
+    git worktree add "$worktree_path" "feature/${feature_name}" 2>/dev/null || {
+      log "Failed to re-attach worktree for issue #${issue_number}"
+      return
+    }
+  else
+    git worktree add "$worktree_path" -b "feature/${feature_name}" origin/main 2>/dev/null || {
+      log "Failed to create worktree for issue #${issue_number}"
+      return
+    }
+  fi
 
   # Generate team prompt
   local team_prompt
