@@ -412,11 +412,16 @@ run_claude() {
   : > "$livefile"
 
   log "Claude output → ${outfile}"
-  log "Live view    → ${livefile}  (tail -f ${livefile})"
+  log "Live view    → ${livefile}"
 
   # Start the live stream formatter
   FORMATTER_PID=""
   start_live_formatter "$outfile" "$livefile"
+
+  # Relay the live file to the terminal (stderr so it's visible inside $() captures)
+  LIVE_TAIL_PID=""
+  tail -f "$livefile" >&2 &
+  LIVE_TAIL_PID=$!
 
   # Done-pattern detection (set by caller via RALPH_DONE_PATTERN)
   local done_pattern="${RALPH_DONE_PATTERN:-}"
@@ -436,6 +441,11 @@ run_claude() {
   done
 
   _kill_formatter() {
+    if [[ -n "${LIVE_TAIL_PID:-}" ]]; then
+      kill "$LIVE_TAIL_PID" 2>/dev/null || true
+      wait "$LIVE_TAIL_PID" 2>/dev/null || true
+      LIVE_TAIL_PID=""
+    fi
     if [[ -n "${FORMATTER_PID:-}" ]]; then
       # Kill entire process group (subshell + tail + python3)
       kill -- -"$FORMATTER_PID" 2>/dev/null || kill "$FORMATTER_PID" 2>/dev/null || true
