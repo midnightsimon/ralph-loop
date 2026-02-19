@@ -84,7 +84,7 @@ done
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
 }
 
 # Track which PRs have already been reviewed (persists across restarts)

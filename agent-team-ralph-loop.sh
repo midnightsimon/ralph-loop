@@ -70,7 +70,7 @@ done
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
 }
 
 # Check if an issue number is in the skip file
