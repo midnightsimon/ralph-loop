@@ -20,7 +20,6 @@ LABEL_FILTER=""
 TIMEOUT=1800  # seconds (30 minutes)
 ISSUE_LIST=""  # comma-separated issue numbers
 PARALLEL=1     # number of issues to process simultaneously
-TEAM_REVIEW=false
 NO_TRIAGE=false
 
 # ── Parse CLI flags ─────────────────────────────────────────────────────────
@@ -42,14 +41,13 @@ while [[ $# -gt 0 ]]; do
       ISSUE_LIST="$2"; shift 2 ;;
     --parallel)
       PARALLEL="$2"; shift 2 ;;
-    --team-review)
-      TEAM_REVIEW=true; shift ;;
     --no-triage)
       NO_TRIAGE=true; shift ;;
     -h|--help)
       echo "Usage: agent-team-ralph-loop.sh [OPTIONS]"
       echo ""
-      echo "Autonomous issue & PR worker using Claude Code agent teams."
+      echo "Autonomous issue worker using Claude Code agent teams."
+      echo "For PR review, see ralph-review-loop.sh."
       echo ""
       echo "Options:"
       echo "  --count N         Number of iterations (default: 1)"
@@ -60,7 +58,6 @@ while [[ $# -gt 0 ]]; do
       echo "  --timeout SECS    Timeout per Claude invocation in seconds (default: 1800)"
       echo "  --issues N,N,N    Comma-separated issue numbers to work on"
       echo "  --parallel N      Process up to N issues simultaneously (default: 1)"
-      echo "  --team-review     Use agent teams for PR review (multi-perspective)"
       echo "  --no-triage       Skip triage, go straight to team execution"
       echo "  -h, --help        Show this help message"
       exit 0
@@ -460,10 +457,6 @@ run_claude() {
   return $rc
 }
 
-find_open_pr() {
-  gh pr list --state open --limit 1 --json number -q '.[0].number // empty'
-}
-
 pick_issue() {
   local labels_to_check=()
 
@@ -563,160 +556,6 @@ You are running in a fully automated headless pipeline with NO human present.
 - If something fails, try to fix it — do not stop and ask
 - There is nobody to respond to your questions — just act
 PROMPT
-}
-
-generate_review_team_prompt() {
-  local pr_number="$1"
-
-  cat <<PROMPT
-You are the team lead for reviewing PR #${pr_number}.
-
-## Instructions
-
-Create an agent team to review this PR. Spawn three reviewers:
-
-1. **Security Reviewer** (Opus) — Focus on security implications, input
-   validation, injection risks, authentication/authorization issues, and
-   sensitive data handling.
-
-2. **Quality Reviewer** (Opus) — Check code quality, test coverage,
-   convention adherence, error handling, and edge cases.
-
-3. **Architecture Reviewer** (Opus) — Evaluate design decisions, performance
-   implications, maintainability, and consistency with the existing codebase.
-
-## Your Role as Lead
-
-1. Spawn the three reviewers above
-2. Have each reviewer examine the PR independently using:
-   - gh pr view ${pr_number}
-   - gh pr diff ${pr_number}
-   - Reading relevant source files for context
-3. Collect their findings
-4. Synthesize a decision:
-   - If fixable issues found: checkout the PR branch, fix, commit, push, then approve and merge
-   - If the PR is good: approve and merge with gh pr merge --squash --delete-branch
-   - If fundamentally broken: close with explanation
-
-CRITICAL — HEADLESS AUTONOMY:
-You are running in a fully automated headless pipeline with NO human present.
-- NEVER ask for approval, confirmation, or permission for ANY action
-- Execute ALL git and gh commands directly (commit, push, merge, close, etc.) without hesitation
-- If something fails, try to fix it — do not stop and ask for guidance
-- There is nobody to respond to your questions — just act
-PROMPT
-}
-
-# ── Core Functions ───────────────────────────────────────────────────────────
-
-review_pr() {
-  local pr_number="$1"
-  local pr_title
-  pr_title=$(gh pr view "$pr_number" --json title -q .title)
-
-  log "Reviewing PR #${pr_number}: ${pr_title}"
-
-  if [[ "$DRY_RUN" == true ]]; then
-    if [[ "$TEAM_REVIEW" == true ]]; then
-      log "[DRY RUN] Would invoke agent team to review PR #${pr_number}"
-      log "[DRY RUN] Team prompt:"
-      generate_review_team_prompt "$pr_number"
-    else
-      log "[DRY RUN] Would invoke Claude to review PR #${pr_number}"
-    fi
-    return
-  fi
-
-  local review_rc=0
-
-  if [[ "$TEAM_REVIEW" == true ]]; then
-    # ── Team-based review ──────────────────────────────────────────────
-    log "Using agent team for PR review..."
-
-    local review_prompt
-    review_prompt=$(generate_review_team_prompt "$pr_number")
-
-    run_claude -p "$review_prompt" \
-      --model "$MODEL" \
-      --max-turns "$MAX_TURNS" \
-      --allowedTools "$ALLOWED_TOOLS" \
-      --teammate-mode in-process || review_rc=$?
-  else
-    # ── Solo review (same as ralph-loop.sh) ────────────────────────────
-    run_claude -p "You are reviewing pull request #${pr_number} in this repository.
-
-## Instructions
-
-1. Run \`gh pr view ${pr_number}\` to read the PR description.
-2. Run \`gh pr diff ${pr_number}\` to see the full diff.
-3. Read any changed files in full to understand context.
-4. Evaluate the PR for:
-   - Correctness and logic errors
-   - Test coverage (are new features tested?)
-   - Adherence to repo conventions (see CLAUDE.md)
-   - Security issues
-   - Code style and clarity
-
-5. **If changes are needed and you can fix them:**
-   - Check out the PR branch: \`gh pr checkout ${pr_number}\`
-   - Make the necessary fixes
-   - Commit with a clear message (conventional commits)
-   - Push the fixes: \`git push\`
-   - Then approve and merge (step 6)
-
-6. **If the PR is good** (either initially or after your fixes):
-   - \`gh pr review ${pr_number} --approve --body \"Looks good! Approved by Ralph.\"\`
-   - \`gh pr merge ${pr_number} --squash --delete-branch\`
-
-7. **If the PR is fundamentally broken** (can't be fixed reasonably):
-   - \`gh pr close ${pr_number} --comment \"Closing: <explanation of why this PR is not mergeable>\"\`
-
-Always explain your reasoning before taking action.
-
-CRITICAL — HEADLESS AUTONOMY:
-You are running in a fully automated headless pipeline with NO human present.
-- NEVER ask for approval, confirmation, or permission for ANY action
-- Execute ALL git and gh commands directly (commit, push, merge, close, etc.) without hesitation
-- If something fails, try to fix it — do not stop and ask for guidance
-- There is nobody to respond to your questions — just act" \
-      --model "$MODEL" \
-      --max-turns "$MAX_TURNS" \
-      --allowedTools "$ALLOWED_TOOLS" || review_rc=$?
-  fi
-
-  # Clean up worktree and branch if PR was merged
-  local pr_state
-  pr_state=$(gh pr view "$pr_number" --json state -q .state 2>/dev/null || echo "")
-  if [[ "$pr_state" == "MERGED" ]]; then
-    local pr_branch
-    pr_branch=$(gh pr view "$pr_number" --json headRefName -q .headRefName 2>/dev/null || echo "")
-    if [[ -n "$pr_branch" ]]; then
-      local worktree_path=""
-      worktree_path=$(git worktree list --porcelain 2>/dev/null | awk -v branch="branch refs/heads/${pr_branch}" '
-        /^worktree / { wt = substr($0, 10) }
-        $0 == branch { print wt; exit }
-        /^$/ { wt = "" }
-      ' || echo "")
-      if [[ -n "$worktree_path" ]]; then
-        log "Cleaning up worktree: ${worktree_path}"
-        git worktree remove "$worktree_path" --force 2>/dev/null || true
-        if [[ -d "$worktree_path" ]]; then
-          log "Removing lingering worktree directory: ${worktree_path}"
-          rm -rf "$worktree_path"
-        fi
-      fi
-      local wt_dir="${REPO_ROOT}/.worktrees/${pr_branch##*/}"
-      if [[ -d "$wt_dir" ]]; then
-        log "Removing worktree directory: ${wt_dir}"
-        git worktree remove "$wt_dir" --force 2>/dev/null || true
-        rm -rf "$wt_dir"
-      fi
-      git branch -D "$pr_branch" 2>/dev/null || true
-      log "Cleaned up branch: ${pr_branch}"
-    fi
-    git worktree prune 2>/dev/null || true
-    git pull origin main 2>/dev/null || true
-  fi
 }
 
 work_issue() {
@@ -937,15 +776,15 @@ for s in starts:
 ISSUE_QUEUE=()
 if [[ -n "$ISSUE_LIST" ]]; then
   IFS=',' read -ra ISSUE_QUEUE <<< "$ISSUE_LIST"
-  # Default COUNT to 2x the number of issues (implement + review each)
+  # Default COUNT to match issue count
   if [[ "$COUNT_EXPLICIT" == false && "${#ISSUE_QUEUE[@]}" -ge 1 ]]; then
-    COUNT=$(( ${#ISSUE_QUEUE[@]} * 2 ))
+    COUNT="${#ISSUE_QUEUE[@]}"
   fi
 fi
 
 # ── Main loop ────────────────────────────────────────────────────────────────
 
-log "Ralph Loop (Agent Teams) starting — count=${COUNT}, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, parallel=${PARALLEL}, team-review=${TEAM_REVIEW}, no-triage=${NO_TRIAGE}, dry-run=${DRY_RUN}"
+log "Ralph Loop (Agent Teams) starting — count=${COUNT}, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, parallel=${PARALLEL}, no-triage=${NO_TRIAGE}, dry-run=${DRY_RUN}"
 if [[ -n "$ISSUE_LIST" ]]; then
   log "Explicit issue list: ${ISSUE_LIST} (${#ISSUE_QUEUE[@]} issues, capped to ${COUNT})"
 fi
@@ -1005,16 +844,11 @@ else
         log "Empty issue number in list, skipping."
       fi
     else
-      pr=$(find_open_pr)
-      if [[ -n "$pr" ]]; then
-        review_pr "$pr"
+      issue=$(pick_issue)
+      if [[ -n "$issue" ]]; then
+        work_issue "$issue"
       else
-        issue=$(pick_issue)
-        if [[ -n "$issue" ]]; then
-          work_issue "$issue"
-        else
-          log "No open PRs or issues found. Nothing to do."
-        fi
+        log "No open issues found. Nothing to do."
       fi
     fi
   done
