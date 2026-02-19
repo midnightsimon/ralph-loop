@@ -112,7 +112,10 @@ start_live_formatter() {
   local raw_file="$1"
   local live_file="$2"
 
-  tail -f "$raw_file" 2>/dev/null | python3 -u - "$live_file" <<'PYFORMAT' &
+  # Write Python formatter to a temp file so stdin stays connected to the
+  # tail pipe (a heredoc would override stdin and starve the parser).
+  _FORMATTER_SCRIPT=$(mktemp "${TMPDIR:-/tmp}/ralph-formatter.XXXXXX.py")
+  cat > "$_FORMATTER_SCRIPT" <<'PYFORMAT'
 import sys, json, os, time
 from datetime import datetime
 
@@ -298,6 +301,7 @@ for raw_line in sys.stdin:
 f.close()
 PYFORMAT
 
+  tail -f "$raw_file" 2>/dev/null | python3 -u "$_FORMATTER_SCRIPT" "$live_file" &
   FORMATTER_PID=$!
 }
 
@@ -351,6 +355,7 @@ run_claude() {
       wait "$FORMATTER_PID" 2>/dev/null || true
       FORMATTER_PID=""
     fi
+    [[ -n "${_FORMATTER_SCRIPT:-}" ]] && rm -f "$_FORMATTER_SCRIPT"
   }
 
   # Run claude with stream-json so each event is flushed as a line in real time.

@@ -20,6 +20,11 @@ PR_LIST=""    # comma-separated PR numbers
 TEAM_REVIEW=false
 WATCH=false
 POLL_INTERVAL=60  # seconds between polls in watch mode
+AGENTS_DIR=""     # directory containing custom agent .md files
+AGENT_NAMES=()
+AGENT_MODELS=()
+AGENT_COLORS=()
+AGENT_INSTRUCTIONS=()
 
 # ── Parse CLI flags ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -40,6 +45,8 @@ while [[ $# -gt 0 ]]; do
       TEAM_REVIEW=true; shift ;;
     --watch)
       WATCH=true; shift ;;
+    --agents-dir)
+      AGENTS_DIR="$2"; shift 2 ;;
     --poll-interval)
       POLL_INTERVAL="$2"; shift 2 ;;
     -h|--help)
@@ -58,6 +65,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --team-review        Use agent team for multi-perspective review"
       echo "  --watch              Run continuously, polling for new PRs"
       echo "  --poll-interval SECS Seconds between polls in watch mode (default: 60)"
+      echo "  --agents-dir PATH    Directory of agent .md files to use as reviewers"
       echo "  -h, --help           Show this help message"
       echo ""
       echo "Examples:"
@@ -65,6 +73,7 @@ while [[ $# -gt 0 ]]; do
       echo "  ralph-review-loop.sh --watch --team-review   # watch with agent team reviews"
       echo "  ralph-review-loop.sh --watch --poll-interval 120  # check every 2 minutes"
       echo "  ralph-review-loop.sh --prs 5,6,7             # review specific PRs and exit"
+      echo "  ralph-review-loop.sh --team-review --agents-dir ./agents  # custom agent reviewers"
       exit 0
       ;;
     *)
@@ -99,6 +108,84 @@ _shutdown() {
 }
 trap _shutdown SIGINT SIGTERM
 
+# ── Custom Agent Loader ──────────────────────────────────────────────────────
+
+load_custom_agents() {
+  local dir="$1"
+  AGENT_NAMES=()
+  AGENT_MODELS=()
+  AGENT_COLORS=()
+  AGENT_INSTRUCTIONS=()
+
+  if [[ ! -d "$dir" ]]; then
+    log "ERROR: agents directory not found: ${dir}"
+    return 1
+  fi
+
+  local count=0
+  for md_file in "$dir"/*.md; do
+    [[ -f "$md_file" ]] || continue
+
+    # Parse YAML frontmatter (between first two --- lines)
+    local name="" model="" color=""
+    local in_frontmatter=false
+    local frontmatter_done=false
+    local instructions=""
+    local line_num=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line_num=$((line_num + 1))
+      if [[ "$line" == "---" ]]; then
+        if [[ "$in_frontmatter" == true ]]; then
+          frontmatter_done=true
+          continue
+        elif [[ $line_num -eq 1 ]]; then
+          in_frontmatter=true
+          continue
+        fi
+      fi
+
+      if [[ "$in_frontmatter" == true && "$frontmatter_done" == false ]]; then
+        # Parse frontmatter fields (handles quoted and unquoted values)
+        local val=""
+        case "$line" in
+          name:*)
+            val="${line#name:}"; val="${val# }"; val="${val%\"}"; val="${val#\"}"
+            name="$val" ;;
+          model:*)
+            val="${line#model:}"; val="${val# }"; val="${val%\"}"; val="${val#\"}"
+            model="$val" ;;
+          color:*)
+            val="${line#color:}"; val="${val# }"; val="${val%\"}"; val="${val#\"}"
+            color="$val" ;;
+        esac
+      elif [[ "$frontmatter_done" == true ]]; then
+        instructions+="${line}"$'\n'
+      fi
+    done < "$md_file"
+
+    # Use filename as fallback name
+    if [[ -z "$name" ]]; then
+      name=$(basename "$md_file" .md)
+    fi
+    [[ -z "$model" ]] && model="opus"
+    [[ -z "$color" ]] && color="cyan"
+
+    AGENT_NAMES+=("$name")
+    AGENT_MODELS+=("$model")
+    AGENT_COLORS+=("$color")
+    AGENT_INSTRUCTIONS+=("$instructions")
+    count=$((count + 1))
+    log "Loaded agent: ${name} (model=${model}, color=${color})"
+  done
+
+  if [[ $count -eq 0 ]]; then
+    log "WARNING: No .md files found in ${dir}"
+    return 1
+  fi
+  log "Loaded ${count} custom agent(s) from ${dir}"
+}
+
 # ── ANSI Colors (matching Claude Code's agent team palette) ──────────────────
 C_RESET='\033[0m'
 C_BOLD='\033[1m'
@@ -116,7 +203,10 @@ start_live_formatter() {
   local raw_file="$1"
   local live_file="$2"
 
-  tail -f "$raw_file" 2>/dev/null | python3 -u - "$live_file" <<'PYFORMAT' &
+  # Write Python formatter to a temp file so stdin stays connected to the
+  # tail pipe (a heredoc would override stdin and starve the parser).
+  _FORMATTER_SCRIPT=$(mktemp "${TMPDIR:-/tmp}/ralph-formatter.XXXXXX.py")
+  cat > "$_FORMATTER_SCRIPT" <<'PYFORMAT'
 import sys, json, os, time
 from datetime import datetime
 
@@ -143,6 +233,24 @@ ROLE_KEYWORDS = {
     "architect":    ["architecture", "architect", "architecture-reviewer"],
     "reviewer":     ["reviewer", "review"],
 }
+
+# Load custom agent names/colors from environment
+_custom = os.environ.get("CUSTOM_AGENT_NAMES", "")
+if _custom:
+    _ansi_map = {
+        "yellow":  "\033[0;33m", "pink":    "\033[0;35m",
+        "red":     "\033[0;31m", "blue":    "\033[0;34m",
+        "green":   "\033[0;32m", "cyan":    "\033[0;36m",
+        "magenta": "\033[0;35m", "white":   "\033[1;37m",
+        "orange":  "\033[0;33m",
+    }
+    for _entry in _custom.split(","):
+        if ":" in _entry:
+            _aname, _acolor = _entry.split(":", 1)
+            _aname = _aname.strip()
+            _key = _aname.lower().replace("-", "_")
+            COLORS[_key] = _ansi_map.get(_acolor.strip(), COLORS["unknown"])
+            ROLE_KEYWORDS[_key] = [_aname.lower(), _key, _aname.lower().replace("-", " ")]
 
 session_to_role = {}
 current_agent = "lead"
@@ -282,6 +390,7 @@ for raw_line in sys.stdin:
 f.close()
 PYFORMAT
 
+  tail -f "$raw_file" 2>/dev/null | python3 -u "$_FORMATTER_SCRIPT" "$live_file" &
   FORMATTER_PID=$!
 }
 
@@ -331,6 +440,7 @@ run_claude() {
       wait "$FORMATTER_PID" 2>/dev/null || true
       FORMATTER_PID=""
     fi
+    [[ -n "${_FORMATTER_SCRIPT:-}" ]] && rm -f "$_FORMATTER_SCRIPT"
   }
 
   claude "${args[@]}" --verbose --output-format stream-json >"$outfile" 2>"$errfile" &
@@ -439,7 +549,49 @@ find_open_prs() {
 generate_review_team_prompt() {
   local pr_number="$1"
 
-  cat <<PROMPT
+  if [[ ${#AGENT_NAMES[@]} -gt 0 ]]; then
+    # ── Dynamic prompt with custom agents ───────────────────────────────
+    echo "You are the team lead for reviewing PR #${pr_number}."
+    echo ""
+    echo "## Teammates to Spawn"
+    echo ""
+
+    local i
+    for ((i = 0; i < ${#AGENT_NAMES[@]}; i++)); do
+      local cap_model="${AGENT_MODELS[$i]}"
+      cap_model="$(echo "${cap_model:0:1}" | tr '[:lower:]' '[:upper:]')${cap_model:1}"
+      echo "### $((i + 1)). ${AGENT_NAMES[$i]} (${cap_model})"
+      echo ""
+      echo "<agent-instructions>"
+      echo "${AGENT_INSTRUCTIONS[$i]}"
+      echo "</agent-instructions>"
+      echo ""
+    done
+
+    cat <<PROMPT
+## Your Role as Lead
+
+1. Spawn each teammate above using their exact name and instructions
+2. Have each reviewer examine the PR independently using:
+   - gh pr view ${pr_number}
+   - gh pr diff ${pr_number}
+   - Reading relevant source files for context
+3. Collect their findings
+4. Synthesize a decision:
+   - If fixable issues found: checkout the PR branch, fix, commit, push, then approve and merge
+   - If the PR is good: approve and merge with gh pr merge --squash --delete-branch
+   - If fundamentally broken: close with explanation
+
+CRITICAL — HEADLESS AUTONOMY:
+You are running in a fully automated headless pipeline with NO human present.
+- NEVER ask for approval, confirmation, or permission for ANY action
+- Execute ALL git and gh commands directly (commit, push, merge, close, etc.) without hesitation
+- If something fails, try to fix it — do not stop and ask for guidance
+- There is nobody to respond to your questions — just act
+PROMPT
+  else
+    # ── Default hardcoded reviewers ─────────────────────────────────────
+    cat <<PROMPT
 You are the team lead for reviewing PR #${pr_number}.
 
 ## Instructions
@@ -476,6 +628,7 @@ You are running in a fully automated headless pipeline with NO human present.
 - If something fails, try to fix it — do not stop and ask for guidance
 - There is nobody to respond to your questions — just act
 PROMPT
+  fi
 }
 
 # ── Core Function ────────────────────────────────────────────────────────────
@@ -507,13 +660,22 @@ review_pr() {
     local review_prompt
     review_prompt=$(generate_review_team_prompt "$pr_number")
 
+    # Detect review completion (merge, close, or approve) and give grace to wrap up
+    export RALPH_DONE_PATTERN="gh pr merge|gh pr close|Approved by|--approve|successfully merged|pull request.*closed"
+    export RALPH_DONE_GRACE=120
+
     run_claude -p "$review_prompt" \
       --model "$MODEL" \
       --max-turns "$MAX_TURNS" \
       --allowedTools "$ALLOWED_TOOLS" \
       --teammate-mode in-process || review_rc=$?
+
+    unset RALPH_DONE_PATTERN RALPH_DONE_GRACE
   else
     # ── Solo review ────────────────────────────────────────────────────
+    export RALPH_DONE_PATTERN="gh pr merge|gh pr close|Approved by|--approve|successfully merged|pull request.*closed"
+    export RALPH_DONE_GRACE=90
+
     run_claude -p "You are reviewing pull request #${pr_number} in this repository.
 
 ## Instructions
@@ -553,6 +715,8 @@ You are running in a fully automated headless pipeline with NO human present.
       --model "$MODEL" \
       --max-turns "$MAX_TURNS" \
       --allowedTools "$ALLOWED_TOOLS" || review_rc=$?
+
+    unset RALPH_DONE_PATTERN RALPH_DONE_GRACE
   fi
 
   # Clean up worktree and branch if PR was merged
@@ -590,6 +754,24 @@ You are running in a fully automated headless pipeline with NO human present.
   fi
 }
 
+# ── Load custom agents (explicit flag or auto-discover from $PWD) ─────────────
+if [[ -z "$AGENTS_DIR" && -d "${PWD}/.claude/agents" ]]; then
+  AGENTS_DIR="${PWD}/.claude/agents"
+  log "Auto-discovered agents directory: ${AGENTS_DIR}"
+fi
+if [[ -n "$AGENTS_DIR" ]]; then
+  load_custom_agents "$AGENTS_DIR"
+  # Export agent names/colors for the live formatter subprocess
+  if [[ ${#AGENT_NAMES[@]} -gt 0 ]]; then
+    _agent_env=""
+    for ((_i = 0; _i < ${#AGENT_NAMES[@]}; _i++)); do
+      [[ -n "$_agent_env" ]] && _agent_env+=","
+      _agent_env+="${AGENT_NAMES[$_i]}:${AGENT_COLORS[$_i]}"
+    done
+    export CUSTOM_AGENT_NAMES="$_agent_env"
+  fi
+fi
+
 # ── Build PR queue from --prs if provided ────────────────────────────────────
 PR_QUEUE=()
 if [[ -n "$PR_LIST" ]]; then
@@ -603,7 +785,7 @@ fi
 
 if [[ "$WATCH" == true ]]; then
   # ── Watch mode: long-running daemon ──────────────────────────────────────
-  log "Ralph Review Loop starting in WATCH mode — poll=${POLL_INTERVAL}s, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, dry-run=${DRY_RUN}"
+  log "Ralph Review Loop starting in WATCH mode — poll=${POLL_INTERVAL}s, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, agents-dir=${AGENTS_DIR:-none}, dry-run=${DRY_RUN}"
   log "Tracking reviewed PRs in: ${REVIEWED_FILE}"
   log "Press Ctrl+C to stop gracefully."
 
@@ -650,7 +832,7 @@ if [[ "$WATCH" == true ]]; then
 
 else
   # ── One-shot mode: review specific PRs or N from queue ───────────────────
-  log "Ralph Review Loop starting — count=${COUNT}, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, dry-run=${DRY_RUN}"
+  log "Ralph Review Loop starting — count=${COUNT}, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, agents-dir=${AGENTS_DIR:-none}, dry-run=${DRY_RUN}"
   if [[ -n "$PR_LIST" ]]; then
     log "Explicit PR list: ${PR_LIST} (${#PR_QUEUE[@]} PRs)"
   fi
