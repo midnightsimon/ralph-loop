@@ -205,7 +205,7 @@ start_live_formatter() {
 
   # Write Python formatter to a temp file so stdin stays connected to the
   # tail pipe (a heredoc would override stdin and starve the parser).
-  _FORMATTER_SCRIPT=$(mktemp "${TMPDIR:-/tmp}/ralph-formatter.XXXXXX.py")
+  _FORMATTER_SCRIPT=$(mktemp "${TMPDIR:-/tmp}/ralph-formatter.XXXXXX")
   cat > "$_FORMATTER_SCRIPT" <<'PYFORMAT'
 import sys, json, os, time
 from datetime import datetime
