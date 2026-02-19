@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="${REPO_ROOT}/.ralph-logs"
+REVIEWED_FILE="${REPO_ROOT}/.ralph-reviewed-prs"
 
 ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,Task,TaskCreate,TaskUpdate,TaskList,TaskGet,\
 Bash(git *),Bash(gh *),Bash(npm *),Bash(npx *),\
@@ -17,6 +18,8 @@ MAX_TURNS=75
 TIMEOUT=1800  # seconds (30 minutes)
 PR_LIST=""    # comma-separated PR numbers
 TEAM_REVIEW=false
+WATCH=false
+POLL_INTERVAL=60  # seconds between polls in watch mode
 
 # ── Parse CLI flags ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -35,6 +38,10 @@ while [[ $# -gt 0 ]]; do
       PR_LIST="$2"; shift 2 ;;
     --team-review)
       TEAM_REVIEW=true; shift ;;
+    --watch)
+      WATCH=true; shift ;;
+    --poll-interval)
+      POLL_INTERVAL="$2"; shift 2 ;;
     -h|--help)
       echo "Usage: ralph-review-loop.sh [OPTIONS]"
       echo ""
@@ -42,14 +49,22 @@ while [[ $# -gt 0 ]]; do
       echo "For issue implementation, see agent-team-ralph-loop.sh."
       echo ""
       echo "Options:"
-      echo "  --count N         Number of PRs to review (default: 1)"
-      echo "  --dry-run         Print what would happen without invoking Claude"
-      echo "  --model MODEL     Model to use: sonnet, opus, haiku (default: opus)"
-      echo "  --max-turns N     Max agentic turns per invocation (default: 75)"
-      echo "  --timeout SECS    Timeout per Claude invocation in seconds (default: 1800)"
-      echo "  --prs N,N,N       Comma-separated PR numbers to review"
-      echo "  --team-review     Use agent team for multi-perspective review"
-      echo "  -h, --help        Show this help message"
+      echo "  --count N            Number of PRs to review (default: 1, ignored in --watch)"
+      echo "  --dry-run            Print what would happen without invoking Claude"
+      echo "  --model MODEL        Model to use: sonnet, opus, haiku (default: opus)"
+      echo "  --max-turns N        Max agentic turns per invocation (default: 75)"
+      echo "  --timeout SECS       Timeout per Claude invocation in seconds (default: 1800)"
+      echo "  --prs N,N,N          Comma-separated PR numbers to review"
+      echo "  --team-review        Use agent team for multi-perspective review"
+      echo "  --watch              Run continuously, polling for new PRs"
+      echo "  --poll-interval SECS Seconds between polls in watch mode (default: 60)"
+      echo "  -h, --help           Show this help message"
+      echo ""
+      echo "Examples:"
+      echo "  ralph-review-loop.sh --watch                 # watch forever, solo review"
+      echo "  ralph-review-loop.sh --watch --team-review   # watch with agent team reviews"
+      echo "  ralph-review-loop.sh --watch --poll-interval 120  # check every 2 minutes"
+      echo "  ralph-review-loop.sh --prs 5,6,7             # review specific PRs and exit"
       exit 0
       ;;
     *)
@@ -62,6 +77,27 @@ done
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
+
+# Track which PRs have already been reviewed (persists across restarts)
+is_reviewed() {
+  local pr_number="$1"
+  [[ -f "$REVIEWED_FILE" ]] && grep -q "^${pr_number}$" "$REVIEWED_FILE"
+}
+
+mark_reviewed() {
+  local pr_number="$1"
+  if ! is_reviewed "$pr_number"; then
+    echo "$pr_number" >> "$REVIEWED_FILE"
+  fi
+}
+
+# Graceful shutdown on SIGINT/SIGTERM
+SHUTDOWN_REQUESTED=false
+_shutdown() {
+  log "Shutdown requested — finishing current review then exiting..."
+  SHUTDOWN_REQUESTED=true
+}
+trap _shutdown SIGINT SIGTERM
 
 # ── ANSI Colors (matching Claude Code's agent team palette) ──────────────────
 C_RESET='\033[0m'
@@ -565,37 +601,87 @@ fi
 
 # ── Main loop ────────────────────────────────────────────────────────────────
 
-log "Ralph Review Loop starting — count=${COUNT}, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, dry-run=${DRY_RUN}"
-if [[ -n "$PR_LIST" ]]; then
-  log "Explicit PR list: ${PR_LIST} (${#PR_QUEUE[@]} PRs)"
-fi
+if [[ "$WATCH" == true ]]; then
+  # ── Watch mode: long-running daemon ──────────────────────────────────────
+  log "Ralph Review Loop starting in WATCH mode — poll=${POLL_INTERVAL}s, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, dry-run=${DRY_RUN}"
+  log "Tracking reviewed PRs in: ${REVIEWED_FILE}"
+  log "Press Ctrl+C to stop gracefully."
 
-for ((i = 1; i <= COUNT; i++)); do
-  log "── Review ${i}/${COUNT} ──────────────────────────────────────"
+  reviews_done=0
 
-  if [[ "${#PR_QUEUE[@]}" -gt 0 ]]; then
-    # Pop first PR from the queue
-    pr="${PR_QUEUE[0]}"
-    if [[ "${#PR_QUEUE[@]}" -le 1 ]]; then
-      PR_QUEUE=()
+  while [[ "$SHUTDOWN_REQUESTED" == false ]]; do
+    # Find all open PRs
+    open_prs=$(find_open_prs 20 2>/dev/null || true)
+
+    if [[ -z "$open_prs" ]]; then
+      log "No open PRs. Sleeping ${POLL_INTERVAL}s..."
     else
-      PR_QUEUE=("${PR_QUEUE[@]:1}")
+      found_new=false
+      for pr in $open_prs; do
+        [[ "$SHUTDOWN_REQUESTED" == true ]] && break
+
+        if is_reviewed "$pr"; then
+          continue
+        fi
+
+        found_new=true
+        reviews_done=$((reviews_done + 1))
+        log "── Review #${reviews_done} (PR #${pr}) ──────────────────────────────────────"
+        review_pr "$pr"
+        mark_reviewed "$pr"
+      done
+
+      if [[ "$found_new" == false ]]; then
+        log "All open PRs already reviewed. Sleeping ${POLL_INTERVAL}s..."
+      fi
     fi
-    pr="${pr// /}"
-    if [[ -n "$pr" ]]; then
-      review_pr "$pr"
-    else
-      log "Empty PR number in list, skipping."
+
+    # Sleep in small increments so we can respond to shutdown quickly
+    if [[ "$SHUTDOWN_REQUESTED" == false ]]; then
+      elapsed=0
+      while [[ $elapsed -lt $POLL_INTERVAL && "$SHUTDOWN_REQUESTED" == false ]]; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+      done
     fi
-  else
-    # Find oldest open PR
-    pr=$(find_open_prs 1 | head -1)
-    if [[ -n "$pr" ]]; then
-      review_pr "$pr"
-    else
-      log "No open PRs found. Nothing to review."
-    fi
+  done
+
+  log "Ralph Review Loop stopped after ${reviews_done} reviews."
+
+else
+  # ── One-shot mode: review specific PRs or N from queue ───────────────────
+  log "Ralph Review Loop starting — count=${COUNT}, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, dry-run=${DRY_RUN}"
+  if [[ -n "$PR_LIST" ]]; then
+    log "Explicit PR list: ${PR_LIST} (${#PR_QUEUE[@]} PRs)"
   fi
-done
 
-log "Ralph Review Loop complete."
+  for ((i = 1; i <= COUNT; i++)); do
+    log "── Review ${i}/${COUNT} ──────────────────────────────────────"
+
+    if [[ "${#PR_QUEUE[@]}" -gt 0 ]]; then
+      # Pop first PR from the queue
+      pr="${PR_QUEUE[0]}"
+      if [[ "${#PR_QUEUE[@]}" -le 1 ]]; then
+        PR_QUEUE=()
+      else
+        PR_QUEUE=("${PR_QUEUE[@]:1}")
+      fi
+      pr="${pr// /}"
+      if [[ -n "$pr" ]]; then
+        review_pr "$pr"
+      else
+        log "Empty PR number in list, skipping."
+      fi
+    else
+      # Find oldest open PR
+      pr=$(find_open_prs 1 | head -1)
+      if [[ -n "$pr" ]]; then
+        review_pr "$pr"
+      else
+        log "No open PRs found. Nothing to review."
+      fi
+    fi
+  done
+
+  log "Ralph Review Loop complete."
+fi
