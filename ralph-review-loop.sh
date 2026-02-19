@@ -588,6 +588,8 @@ You are running in a fully automated headless pipeline with NO human present.
 - Execute ALL git and gh commands directly (commit, push, merge, close, etc.) without hesitation
 - If something fails, try to fix it — do not stop and ask for guidance
 - There is nobody to respond to your questions — just act
+- Do NOT use plan mode for teammates — they should start working immediately
+- NEVER use \`sleep\` or busy-wait loops to wait for teammates — messages are delivered automatically when teammates finish their turns
 PROMPT
   else
     # ── Default hardcoded reviewers ─────────────────────────────────────
@@ -627,6 +629,8 @@ You are running in a fully automated headless pipeline with NO human present.
 - Execute ALL git and gh commands directly (commit, push, merge, close, etc.) without hesitation
 - If something fails, try to fix it — do not stop and ask for guidance
 - There is nobody to respond to your questions — just act
+- Do NOT use plan mode for teammates — they should start working immediately
+- NEVER use \`sleep\` or busy-wait loops to wait for teammates — messages are delivered automatically when teammates finish their turns
 PROMPT
   fi
 }
@@ -711,7 +715,9 @@ You are running in a fully automated headless pipeline with NO human present.
 - NEVER ask for approval, confirmation, or permission for ANY action
 - Execute ALL git and gh commands directly (commit, push, merge, close, etc.) without hesitation
 - If something fails, try to fix it — do not stop and ask for guidance
-- There is nobody to respond to your questions — just act" \
+- There is nobody to respond to your questions — just act
+- Do NOT use plan mode for teammates — they should start working immediately
+- NEVER use \`sleep\` or busy-wait loops to wait for teammates — messages are delivered automatically when teammates finish their turns" \
       --model "$MODEL" \
       --max-turns "$MAX_TURNS" \
       --allowedTools "$ALLOWED_TOOLS" || review_rc=$?
