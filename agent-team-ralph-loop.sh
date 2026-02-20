@@ -555,14 +555,22 @@ Create an agent team with these teammates:
 
 ## Your Role as Lead
 
-1. Spawn the teammates above
-2. Create tasks for each phase: research, implement, test
-3. Set task dependencies: implement depends on research, test depends on implement
-4. Monitor progress and relay context between teammates
-5. When all tests pass:
+1. Spawn the Researcher using the Task tool with \`run_in_background: true\`
+2. Use \`TaskOutput\` with \`block: true\` to wait for the Researcher's findings
+3. Spawn the Implementer (passing the research findings in its prompt) with \`run_in_background: true\`
+4. Use \`TaskOutput\` with \`block: true\` to wait for the Implementer to finish
+5. Spawn the Tester (passing implementation context) with \`run_in_background: true\`
+6. Use \`TaskOutput\` with \`block: true\` to wait for the Tester
+7. If tests fail, spawn the Implementer again with the failures and re-test — iterate until pass
+8. When all tests pass:
    - Push the branch: git push -u origin feature/${feature_name}
    - Create a PR: gh pr create --title "<title>" --body "Closes #${issue_number}\n\n<description>"
-6. After PR is created, clean up the team and stop
+
+IMPORTANT — SPAWNING PATTERN (you MUST follow this):
+- Spawn each teammate with \`run_in_background: true\` using the Task tool
+- Then call \`TaskOutput\` (with \`block: true\`) to wait for each teammate's result before proceeding
+- Do NOT use TeamCreate — just use Task directly
+- Do NOT end your turn with just a text message — always have an active tool call
 
 CRITICAL — HEADLESS AUTONOMY:
 You are running in a fully automated headless pipeline with NO human present.
@@ -571,7 +579,7 @@ You are running in a fully automated headless pipeline with NO human present.
 - If something fails, try to fix it — do not stop and ask
 - There is nobody to respond to your questions — just act
 - Do NOT use plan mode for teammates — they should start working immediately
-- NEVER use \`sleep\` or busy-wait loops to wait for teammates — messages are delivered automatically when teammates finish their turns
+- NEVER use \`sleep\` or busy-wait loops — use TaskOutput to wait for results
 PROMPT
 }
 
@@ -789,7 +797,7 @@ for s in starts:
     --model "$MODEL" \
     --max-turns "$MAX_TURNS" \
     --allowedTools "$ALLOWED_TOOLS" \
-    --teammate-mode in-process || phase2_rc=$?
+    || phase2_rc=$?
 
   # Clear done-pattern so it doesn't affect subsequent run_claude calls
   unset RALPH_DONE_PATTERN RALPH_DONE_GRACE

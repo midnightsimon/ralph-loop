@@ -583,16 +583,22 @@ generate_review_team_prompt() {
     cat <<PROMPT
 ## Your Role as Lead
 
-1. Spawn each teammate above using their exact name and instructions
-2. Have each reviewer examine the PR independently using:
+1. Spawn each teammate above using the Task tool with \`run_in_background: true\`
+2. Each reviewer should examine the PR independently using:
    - gh pr view ${pr_number}
    - gh pr diff ${pr_number}
    - Reading relevant source files for context
-3. Collect their findings
-4. Synthesize a decision:
+3. After spawning ALL teammates, use \`TaskOutput\` with \`block: true\` to wait for each one's result
+4. Once you have all results, synthesize a decision:
    - If fixable issues found: checkout the PR branch, fix, commit, push, then approve and merge
    - If the PR is good: approve and merge with gh pr merge --squash --delete-branch
    - If fundamentally broken: close with explanation
+
+IMPORTANT — SPAWNING PATTERN (you MUST follow this):
+- Spawn each teammate with \`run_in_background: true\` so they run in parallel
+- Then call \`TaskOutput\` (with \`block: true\`) for each spawned task to collect their results
+- Do NOT use TeamCreate — just use Task directly
+- Do NOT end your turn with just a text message — always have an active tool call
 
 CRITICAL — HEADLESS AUTONOMY:
 You are running in a fully automated headless pipeline with NO human present.
@@ -601,7 +607,7 @@ You are running in a fully automated headless pipeline with NO human present.
 - If something fails, try to fix it — do not stop and ask for guidance
 - There is nobody to respond to your questions — just act
 - Do NOT use plan mode for teammates — they should start working immediately
-- NEVER use \`sleep\` or busy-wait loops to wait for teammates — messages are delivered automatically when teammates finish their turns
+- NEVER use \`sleep\` or busy-wait loops — use TaskOutput to wait for results
 PROMPT
   else
     # ── Default hardcoded reviewers ─────────────────────────────────────
@@ -624,16 +630,22 @@ Create an agent team to review this PR. Spawn three reviewers:
 
 ## Your Role as Lead
 
-1. Spawn the three reviewers above
-2. Have each reviewer examine the PR independently using:
+1. Spawn the three reviewers above using the Task tool with \`run_in_background: true\`
+2. Each reviewer should examine the PR independently using:
    - gh pr view ${pr_number}
    - gh pr diff ${pr_number}
    - Reading relevant source files for context
-3. Collect their findings
-4. Synthesize a decision:
+3. After spawning ALL reviewers, use \`TaskOutput\` with \`block: true\` to wait for each one's result
+4. Once you have all results, synthesize a decision:
    - If fixable issues found: checkout the PR branch, fix, commit, push, then approve and merge
    - If the PR is good: approve and merge with gh pr merge --squash --delete-branch
    - If fundamentally broken: close with explanation
+
+IMPORTANT — SPAWNING PATTERN (you MUST follow this):
+- Spawn each reviewer with \`run_in_background: true\` so they run in parallel
+- Then call \`TaskOutput\` (with \`block: true\`) for each spawned task to collect their results
+- Do NOT use TeamCreate — just use Task directly
+- Do NOT end your turn with just a text message — always have an active tool call
 
 CRITICAL — HEADLESS AUTONOMY:
 You are running in a fully automated headless pipeline with NO human present.
@@ -642,7 +654,7 @@ You are running in a fully automated headless pipeline with NO human present.
 - If something fails, try to fix it — do not stop and ask for guidance
 - There is nobody to respond to your questions — just act
 - Do NOT use plan mode for teammates — they should start working immediately
-- NEVER use \`sleep\` or busy-wait loops to wait for teammates — messages are delivered automatically when teammates finish their turns
+- NEVER use \`sleep\` or busy-wait loops — use TaskOutput to wait for results
 PROMPT
   fi
 }
@@ -684,7 +696,7 @@ review_pr() {
       --model "$MODEL" \
       --max-turns "$MAX_TURNS" \
       --allowedTools "$ALLOWED_TOOLS" \
-      --teammate-mode in-process || review_rc=$?
+      || review_rc=$?
 
     unset RALPH_DONE_PATTERN RALPH_DONE_GRACE
   else
