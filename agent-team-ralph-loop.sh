@@ -548,29 +548,46 @@ Create an agent team with these teammates:
    the changes in the worktree. Follow the implementation plan. Use conventional
    commits (feat:, fix:, refactor:, etc.). Commit often.
 
-3. **Tester** — Use Opus. Wait for the Implementer to finish, then run the
-   test suite. If tests fail, message the Implementer with the failures so they
-   can fix them. Iterate until tests pass. Run:
-   - npm -w @typeblazer/web run test:unit
-   - npm -w @typeblazer/api run test
+3. **Tester** — Use Opus. Run the full test suite and return the results.
+   Do NOT attempt to fix code or message other agents — just run these commands
+   and report whether each passed or failed, with the full error output for any
+   failures. Use \`timeout: 300000\` (5 minutes) on each Bash call since tests
+   may take several minutes. Run in this order:
    - npm run lint
+   - npm -w @typeblazer/api run test
+   - npm -w @typeblazer/web run test:unit
 
 ## Your Role as Lead
 
-1. Spawn the Researcher using the Task tool with \`run_in_background: true\`
-2. Use \`TaskOutput\` with \`block: true\` to wait for the Researcher's findings
-3. Spawn the Implementer (passing the research findings in its prompt) with \`run_in_background: true\`
-4. Use \`TaskOutput\` with \`block: true\` to wait for the Implementer to finish
-5. Spawn the Tester (passing implementation context) with \`run_in_background: true\`
-6. Use \`TaskOutput\` with \`block: true\` to wait for the Tester
-7. If tests fail, spawn the Implementer again with the failures and re-test — iterate until pass
-8. When all tests pass:
-   - Push the branch: git push -u origin feature/${feature_name}
-   - Create a PR: gh pr create --title "<title>" --body "Closes #${issue_number}\n\n<description>"
+CRITICAL — TIMEOUT ON TaskOutput:
+Every \`TaskOutput\` call MUST include \`timeout: 600000\` (10 minutes). The default
+30-second timeout is far too short — subagents take minutes, not seconds.
+Example: \`TaskOutput(task_id, block: true, timeout: 600000)\`
+
+### Phase A: Research
+1. Spawn Researcher with \`run_in_background: true\`
+2. \`TaskOutput\` with \`block: true, timeout: 600000\`
+
+### Phase B: Implement
+3. Spawn Implementer (pass research findings) with \`run_in_background: true\`
+4. \`TaskOutput\` with \`block: true, timeout: 600000\`
+
+### Phase C: Test-Fix Loop (max 3 iterations)
+5. Spawn Tester with \`run_in_background: true\`
+6. \`TaskOutput\` with \`block: true, timeout: 600000\`
+7. If ALL tests pass → Phase D
+   If any fail → spawn NEW Implementer with full failure output, wait, go to step 5
+   After 3 iterations → Phase D regardless (note failures in PR)
+
+### Phase D: Ship It
+8. git push -u origin feature/${feature_name}
+9. gh pr create --title "<title>" --body "Closes #${issue_number}\n\n<description>"
 
 IMPORTANT — SPAWNING PATTERN (you MUST follow this):
 - Spawn each teammate with \`run_in_background: true\` using the Task tool
-- Then call \`TaskOutput\` (with \`block: true\`) to wait for each teammate's result before proceeding
+- Then call \`TaskOutput\` (with \`block: true, timeout: 600000\`) to wait for each teammate's result before proceeding
+- \`timeout: 600000\` is MANDATORY — without it, TaskOutput defaults to 30s and you waste dozens of turns re-polling
+- Tell the Tester to use \`timeout: 300000\` on Bash calls for npm commands
 - Do NOT use TeamCreate — just use Task directly
 - Do NOT end your turn with just a text message — always have an active tool call
 
@@ -582,6 +599,8 @@ You are running in a fully automated headless pipeline with NO human present.
 - There is nobody to respond to your questions — just act
 - Do NOT use plan mode for teammates — they should start working immediately
 - NEVER use \`sleep\` or busy-wait loops — use TaskOutput to wait for results
+- Subagents CANNOT message each other — only YOU (the lead) can orchestrate the fix cycle
+- If the Tester reports failures, YOU spawn a new Implementer with the failures — the Tester cannot do this
 PROMPT
 }
 
