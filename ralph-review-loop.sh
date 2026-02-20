@@ -561,10 +561,23 @@ find_open_prs() {
 
 generate_review_team_prompt() {
   local pr_number="$1"
+  local worktree_path="$2"
+
+  local worktree_section
+  worktree_section=$(cat <<WTSECTION
+## Worktree
+A git worktree has been created for this PR at: ${worktree_path}
+All code reading and fixes MUST happen in this worktree directory.
+Do NOT use \`gh pr checkout\` — the branch is already checked out in the worktree.
+If fixes are needed, make changes in the worktree, commit, and push from there.
+WTSECTION
+)
 
   if [[ ${#AGENT_NAMES[@]} -gt 0 ]]; then
     # ── Dynamic prompt with custom agents ───────────────────────────────
     echo "You are the team lead for reviewing PR #${pr_number}."
+    echo ""
+    echo "${worktree_section}"
     echo ""
     echo "## Teammates to Spawn"
     echo ""
@@ -588,10 +601,10 @@ generate_review_team_prompt() {
 2. Each reviewer should examine the PR independently using:
    - gh pr view ${pr_number}
    - gh pr diff ${pr_number}
-   - Reading relevant source files for context
+   - Reading relevant source files in the worktree (${worktree_path}) for context
 3. After spawning ALL teammates, use \`TaskOutput\` with \`block: true\` to wait for each one's result
 4. Once you have all results, synthesize a decision:
-   - If fixable issues found: checkout the PR branch, fix, commit, push, then approve and merge
+   - If fixable issues found: make fixes in the worktree (${worktree_path}), commit, push, then approve and merge
    - If the PR is good: approve and merge with gh pr merge --squash --delete-branch
    - If fundamentally broken: close with explanation
 
@@ -615,6 +628,8 @@ PROMPT
     cat <<PROMPT
 You are the team lead for reviewing PR #${pr_number}.
 
+${worktree_section}
+
 ## Instructions
 
 Create an agent team to review this PR. Spawn three reviewers:
@@ -635,10 +650,10 @@ Create an agent team to review this PR. Spawn three reviewers:
 2. Each reviewer should examine the PR independently using:
    - gh pr view ${pr_number}
    - gh pr diff ${pr_number}
-   - Reading relevant source files for context
+   - Reading relevant source files in the worktree (${worktree_path}) for context
 3. After spawning ALL reviewers, use \`TaskOutput\` with \`block: true\` to wait for each one's result
 4. Once you have all results, synthesize a decision:
-   - If fixable issues found: checkout the PR branch, fix, commit, push, then approve and merge
+   - If fixable issues found: make fixes in the worktree (${worktree_path}), commit, push, then approve and merge
    - If the PR is good: approve and merge with gh pr merge --squash --delete-branch
    - If fundamentally broken: close with explanation
 
@@ -664,21 +679,43 @@ PROMPT
 
 review_pr() {
   local pr_number="$1"
-  local pr_title
+  local pr_title pr_branch
   pr_title=$(gh pr view "$pr_number" --json title -q .title)
+  pr_branch=$(gh pr view "$pr_number" --json headRefName -q .headRefName 2>/dev/null || echo "")
 
-  log "Reviewing PR #${pr_number}: ${pr_title}"
+  log "Reviewing PR #${pr_number}: ${pr_title} (branch: ${pr_branch})"
 
   if [[ "$DRY_RUN" == true ]]; then
     if [[ "$TEAM_REVIEW" == true ]]; then
       log "[DRY RUN] Would invoke agent team to review PR #${pr_number}"
       log "[DRY RUN] Team prompt:"
-      generate_review_team_prompt "$pr_number"
+      generate_review_team_prompt "$pr_number" "/tmp/example-worktree"
     else
       log "[DRY RUN] Would invoke Claude to review PR #${pr_number}"
     fi
     return
   fi
+
+  # ── Create a worktree so we don't touch the main working tree ──────
+  mkdir -p "${REPO_ROOT}/.worktrees"
+  local worktree_path="${REPO_ROOT}/.worktrees/review-pr-${pr_number}"
+
+  # Fetch the PR branch so it's available locally
+  git fetch origin "pull/${pr_number}/head:${pr_branch}" 2>/dev/null || \
+    git fetch origin "${pr_branch}" 2>/dev/null || true
+
+  if [[ -d "$worktree_path" ]]; then
+    log "Reusing existing review worktree: ${worktree_path}"
+  else
+    git worktree add "$worktree_path" "$pr_branch" 2>/dev/null || {
+      log "Failed to create review worktree for PR #${pr_number} — falling back to detached HEAD"
+      git worktree add --detach "$worktree_path" "$pr_branch" 2>/dev/null || {
+        log "ERROR: Could not create worktree at all for PR #${pr_number}"
+        return 1
+      }
+    }
+  fi
+  log "Review worktree ready: ${worktree_path}"
 
   local review_rc=0
 
@@ -687,7 +724,7 @@ review_pr() {
     log "Using agent team for PR review..."
 
     local review_prompt
-    review_prompt=$(generate_review_team_prompt "$pr_number")
+    review_prompt=$(generate_review_team_prompt "$pr_number" "$worktree_path")
 
     # Detect review completion (merge, close, or approve) and give grace to wrap up
     export RALPH_DONE_PATTERN="gh pr merge|gh pr close|Approved by|--approve|successfully merged|pull request.*closed"
@@ -707,11 +744,17 @@ review_pr() {
 
     run_claude -p "You are reviewing pull request #${pr_number} in this repository.
 
+## Worktree
+A git worktree has been created for this PR at: ${worktree_path}
+Branch: ${pr_branch}
+All code reading and fixes MUST happen in this worktree directory.
+Do NOT use \`gh pr checkout\` — the branch is already checked out in the worktree.
+
 ## Instructions
 
 1. Run \`gh pr view ${pr_number}\` to read the PR description.
 2. Run \`gh pr diff ${pr_number}\` to see the full diff.
-3. Read any changed files in full to understand context.
+3. Read any changed files in the worktree (\`${worktree_path}/...\`) to understand context.
 4. Evaluate the PR for:
    - Correctness and logic errors
    - Test coverage (are new features tested?)
@@ -720,10 +763,10 @@ review_pr() {
    - Code style and clarity
 
 5. **If changes are needed and you can fix them:**
-   - Check out the PR branch: \`gh pr checkout ${pr_number}\`
-   - Make the necessary fixes
-   - Commit with a clear message (conventional commits)
-   - Push the fixes: \`git push\`
+   - Make the fixes in the worktree directory (${worktree_path})
+   - Commit with a clear message (conventional commits) — run git commands from the worktree:
+     \`cd ${worktree_path} && git add . && git commit -m \"fix: ...\"\`
+   - Push the fixes: \`cd ${worktree_path} && git push origin ${pr_branch}\`
    - Then approve and merge (step 6)
 
 6. **If the PR is good** (either initially or after your fixes):
@@ -750,38 +793,39 @@ You are running in a fully automated headless pipeline with NO human present.
     unset RALPH_DONE_PATTERN RALPH_DONE_GRACE
   fi
 
-  # Clean up worktree and branch if PR was merged
+  # Always clean up the review worktree (it's ours, not the user's)
+  if [[ -d "$worktree_path" ]]; then
+    log "Cleaning up review worktree: ${worktree_path}"
+    git worktree remove "$worktree_path" --force 2>/dev/null || true
+    if [[ -d "$worktree_path" ]]; then
+      rm -rf "$worktree_path"
+    fi
+  fi
+
+  # Clean up branch and sync main if PR was merged
   local pr_state
   pr_state=$(gh pr view "$pr_number" --json state -q .state 2>/dev/null || echo "")
   if [[ "$pr_state" == "MERGED" ]]; then
-    local pr_branch
-    pr_branch=$(gh pr view "$pr_number" --json headRefName -q .headRefName 2>/dev/null || echo "")
     if [[ -n "$pr_branch" ]]; then
-      local worktree_path=""
-      worktree_path=$(git worktree list --porcelain 2>/dev/null | awk -v branch="branch refs/heads/${pr_branch}" '
+      # Also check for any other worktrees using this branch
+      local other_wt=""
+      other_wt=$(git worktree list --porcelain 2>/dev/null | awk -v branch="branch refs/heads/${pr_branch}" '
         /^worktree / { wt = substr($0, 10) }
         $0 == branch { print wt; exit }
         /^$/ { wt = "" }
       ' || echo "")
-      if [[ -n "$worktree_path" ]]; then
-        log "Cleaning up worktree: ${worktree_path}"
-        git worktree remove "$worktree_path" --force 2>/dev/null || true
-        if [[ -d "$worktree_path" ]]; then
-          log "Removing lingering worktree directory: ${worktree_path}"
-          rm -rf "$worktree_path"
-        fi
-      fi
-      local wt_dir="${REPO_ROOT}/.worktrees/${pr_branch##*/}"
-      if [[ -d "$wt_dir" ]]; then
-        log "Removing worktree directory: ${wt_dir}"
-        git worktree remove "$wt_dir" --force 2>/dev/null || true
-        rm -rf "$wt_dir"
+      if [[ -n "$other_wt" ]]; then
+        log "Cleaning up worktree: ${other_wt}"
+        git worktree remove "$other_wt" --force 2>/dev/null || true
+        [[ -d "$other_wt" ]] && rm -rf "$other_wt"
       fi
       git branch -D "$pr_branch" 2>/dev/null || true
       log "Cleaned up branch: ${pr_branch}"
     fi
     git worktree prune 2>/dev/null || true
     git pull origin main 2>/dev/null || true
+  else
+    git worktree prune 2>/dev/null || true
   fi
 }
 
