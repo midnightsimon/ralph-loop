@@ -390,8 +390,9 @@ for raw_line in sys.stdin:
 f.close()
 PYFORMAT
 
-  # Subshell so we can kill the entire process group (tail + python3)
-  (tail -f "$raw_file" 2>/dev/null | python3 -u "$_FORMATTER_SCRIPT" "$live_file") &
+  # Close stdout (>/dev/null) so the formatter subshell doesn't hold the $() pipe
+  # open when run_claude is called inside plan_output=$(run_claude ...).
+  (tail -f "$raw_file" 2>/dev/null | python3 -u "$_FORMATTER_SCRIPT" "$live_file") >/dev/null &
   FORMATTER_PID=$!
 }
 
