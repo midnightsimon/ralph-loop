@@ -562,11 +562,13 @@ find_open_prs() {
 generate_review_team_prompt() {
   local pr_number="$1"
   local worktree_path="$2"
+  local pr_branch="$3"
 
   local worktree_section
   worktree_section=$(cat <<WTSECTION
 ## Worktree
 A git worktree has been created for this PR at: ${worktree_path}
+Branch: ${pr_branch}
 All code reading and fixes MUST happen in this worktree directory.
 Do NOT use \`gh pr checkout\` — the branch is already checked out in the worktree.
 If fixes are needed, make changes in the worktree, commit, and push from there.
@@ -624,53 +626,68 @@ You are running in a fully automated headless pipeline with NO human present.
 - NEVER use \`sleep\` or busy-wait loops — use TaskOutput to wait for results
 PROMPT
   else
-    # ── Default hardcoded reviewers ─────────────────────────────────────
+    # ── Default: Cornelius solo code reviewer ─────────────────────────────
     cat <<PROMPT
-You are the team lead for reviewing PR #${pr_number}.
+You are Cornelius, a meticulous and thorough code reviewer. You are reviewing PR #${pr_number}.
 
 ${worktree_section}
 
-## Instructions
+## Review Process
 
-Create an agent team to review this PR. Spawn three reviewers:
+You work alone — do NOT spawn sub-agents, teams, or teammates. Review this PR yourself.
 
-1. **Security Reviewer** (Opus) — Focus on security implications, input
-   validation, injection risks, authentication/authorization issues, and
-   sensitive data handling.
+1. Run \`gh pr view ${pr_number}\` to read the PR description.
+2. Run \`gh pr diff ${pr_number}\` to see the full diff.
+3. Read changed files in the worktree (\`${worktree_path}/...\`) to understand context.
+4. Evaluate the PR thoroughly for:
+   - **Correctness**: Logic errors, bugs, edge cases
+   - **Security**: Input validation, injection risks, authentication/authorization, sensitive data
+   - **Quality**: Test coverage, error handling, code style, convention adherence
+   - **Architecture**: Design decisions, performance, maintainability, codebase consistency
 
-2. **Quality Reviewer** (Opus) — Check code quality, test coverage,
-   convention adherence, error handling, and edge cases.
+## After Review
 
-3. **Architecture Reviewer** (Opus) — Evaluate design decisions, performance
-   implications, maintainability, and consistency with the existing codebase.
+5. **If changes are needed and you can fix them:**
+   - Make the fixes in the worktree directory (${worktree_path})
+   - Commit with conventional commit messages:
+     \`cd ${worktree_path} && git add . && git commit -m "fix: ..."\`
+   - Push: \`cd ${worktree_path} && git push origin ${pr_branch}\`
+   - Then approve and merge (step 6)
 
-## Your Role as Lead
+6. **If the PR is acceptable** (either initially or after your fixes):
+   - \`gh pr review ${pr_number} --approve --body "Reviewed and approved by Cornelius."\`
+   - \`gh pr merge ${pr_number} --squash --delete-branch\`
 
-1. Spawn the three reviewers above using the Task tool with \`run_in_background: true\`
-2. Each reviewer should examine the PR independently using:
-   - gh pr view ${pr_number}
-   - gh pr diff ${pr_number}
-   - Reading relevant source files in the worktree (${worktree_path}) for context
-3. After spawning ALL reviewers, use \`TaskOutput\` with \`block: true\` to wait for each one's result
-4. Once you have all results, synthesize a decision:
-   - If fixable issues found: make fixes in the worktree (${worktree_path}), commit, push, then approve and merge
-   - If the PR is good: approve and merge with gh pr merge --squash --delete-branch
-   - If fundamentally broken: close with explanation
+7. **If the PR is fundamentally broken** (can't be fixed reasonably):
+   - \`gh pr close ${pr_number} --comment "Closing: <explanation>"\`
 
-IMPORTANT — SPAWNING PATTERN (you MUST follow this):
-- Spawn each reviewer with \`run_in_background: true\` so they run in parallel
-- Then call \`TaskOutput\` (with \`block: true\`) for each spawned task to collect their results
-- Do NOT use TeamCreate — just use Task directly
-- Do NOT end your turn with just a text message — always have an active tool call
+## Cleanup After Merge/Close
+
+After merging or closing the PR, clean up:
+- Remove the review worktree: \`git worktree remove ${worktree_path} --force 2>/dev/null || true\`
+- Delete the local branch: \`git branch -D ${pr_branch} 2>/dev/null || true\`
+- Prune stale worktrees: \`git worktree prune 2>/dev/null || true\`
+
+## Future Issues
+
+If you identify concerns that don't block this PR but should be tracked for
+the future (tech debt, missing tests, potential improvements, performance
+concerns, etc.), create a GitHub issue for each concern:
+
+First ensure the label exists:
+  \`gh label create review-followup --description "Follow-up from PR review" --color "c5def5" 2>/dev/null || true\`
+
+Then create issues:
+  \`gh issue create --title "<concise title>" --body "<description with context and PR #${pr_number} reference>" --label "review-followup"\`
 
 CRITICAL — HEADLESS AUTONOMY:
 You are running in a fully automated headless pipeline with NO human present.
 - NEVER ask for approval, confirmation, or permission for ANY action
-- Execute ALL git and gh commands directly (commit, push, merge, close, etc.) without hesitation
+- Execute ALL git and gh commands directly without hesitation
 - If something fails, try to fix it — do not stop and ask for guidance
 - There is nobody to respond to your questions — just act
-- Do NOT use plan mode for teammates — they should start working immediately
-- NEVER use \`sleep\` or busy-wait loops — use TaskOutput to wait for results
+- Do NOT spawn sub-agents, use TeamCreate, or use the Task tool to create teammates
+- NEVER use \`sleep\` or busy-wait loops
 PROMPT
   fi
 }
@@ -687,9 +704,9 @@ review_pr() {
 
   if [[ "$DRY_RUN" == true ]]; then
     if [[ "$TEAM_REVIEW" == true ]]; then
-      log "[DRY RUN] Would invoke agent team to review PR #${pr_number}"
-      log "[DRY RUN] Team prompt:"
-      generate_review_team_prompt "$pr_number" "/tmp/example-worktree"
+      log "[DRY RUN] Would invoke Cornelius to review PR #${pr_number}"
+      log "[DRY RUN] Review prompt:"
+      generate_review_team_prompt "$pr_number" "/tmp/example-worktree" "example-branch"
     else
       log "[DRY RUN] Would invoke Claude to review PR #${pr_number}"
     fi
@@ -721,10 +738,10 @@ review_pr() {
 
   if [[ "$TEAM_REVIEW" == true ]]; then
     # ── Team-based review ──────────────────────────────────────────────
-    log "Using agent team for PR review..."
+    log "Dispatching Cornelius for PR review..."
 
     local review_prompt
-    review_prompt=$(generate_review_team_prompt "$pr_number" "$worktree_path")
+    review_prompt=$(generate_review_team_prompt "$pr_number" "$worktree_path" "$pr_branch")
 
     # Detect review completion (merge, close, or approve) and give grace to wrap up
     export RALPH_DONE_PATTERN="gh pr merge|gh pr close|Approved by|--approve|successfully merged|pull request.*closed"
