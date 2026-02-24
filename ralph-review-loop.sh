@@ -846,11 +846,7 @@ You are running in a fully automated headless pipeline with NO human present.
   fi
 }
 
-# ── Load custom agents (explicit flag or auto-discover from $PWD) ─────────────
-if [[ -z "$AGENTS_DIR" && -d "${PWD}/.claude/agents" ]]; then
-  AGENTS_DIR="${PWD}/.claude/agents"
-  log "Auto-discovered agents directory: ${AGENTS_DIR}"
-fi
+# ── Load custom agents (only when --agents-dir is explicitly passed) ───────────
 if [[ -n "$AGENTS_DIR" ]]; then
   load_custom_agents "$AGENTS_DIR"
   # Export agent names/colors for the live formatter subprocess
