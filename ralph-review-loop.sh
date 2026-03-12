@@ -117,9 +117,9 @@ mark_reviewed() {
 has_reviewer_reviewed() {
   local pr_number="$1" reviewer="$2" repo_nwo="$3"
   local count
-  count=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/reviews" \
-    --jq --arg user "$reviewer" \
-    '[.[] | select(.user.login == $user)] | length' 2>/dev/null || echo "0")
+  count=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/reviews" 2>/dev/null \
+    | jq --arg user "$reviewer" \
+    '[.[] | select(.user.login == $user and .state != "PENDING")] | length' 2>/dev/null || echo "0")
   [[ "$count" -gt 0 ]]
 }
 
@@ -128,17 +128,25 @@ get_reviewer_comments() {
   local pr_number="$1" reviewer="$2" repo_nwo="$3"
   local comments=""
 
+  # Get the reviewer's latest review state (APPROVED, CHANGES_REQUESTED, etc.)
+  local review_state
+  review_state=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/reviews" 2>/dev/null \
+    | jq -r --arg user "$reviewer" \
+    '[.[] | select(.user.login == $user and .state != "PENDING")] | last | .state // "UNKNOWN"' \
+    2>/dev/null || echo "UNKNOWN")
+  comments+="### Verdict: ${review_state}\n\n"
+
   # Get review-level summaries
   local review_bodies
-  review_bodies=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/reviews" \
-    --jq --arg user "$reviewer" \
+  review_bodies=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/reviews" 2>/dev/null \
+    | jq -r --arg user "$reviewer" \
     '[.[] | select(.user.login == $user) | .body | select(. != null and . != "")] | join("\n\n")' \
     2>/dev/null || echo "")
 
   # Get inline review comments (line-level findings on specific files)
   local inline_comments
-  inline_comments=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/comments" \
-    --jq --arg user "$reviewer" \
+  inline_comments=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/comments" 2>/dev/null \
+    | jq -r --arg user "$reviewer" \
     '[.[] | select(.user.login == $user) | "File: \(.path), Line: \(.line // .original_line // "N/A")\n\(.body)"] | join("\n\n---\n\n")' \
     2>/dev/null || echo "")
 
