@@ -25,6 +25,9 @@ AGENT_NAMES=()
 AGENT_MODELS=()
 AGENT_COLORS=()
 AGENT_INSTRUCTIONS=()
+WAIT_FOR_REVIEWER=""          # GitHub login to wait for (e.g., "devin-ai-integration[bot]")
+REVIEWER_WAIT_TIMEOUT=600    # max seconds to wait in one-shot mode (10 min)
+REVIEWER_POLL_INTERVAL=30    # seconds between API checks in one-shot mode
 
 # ── Parse CLI flags ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -49,6 +52,12 @@ while [[ $# -gt 0 ]]; do
       AGENTS_DIR="$2"; shift 2 ;;
     --poll-interval)
       POLL_INTERVAL="$2"; shift 2 ;;
+    --wait-for-reviewer)
+      WAIT_FOR_REVIEWER="$2"; shift 2 ;;
+    --reviewer-timeout)
+      REVIEWER_WAIT_TIMEOUT="$2"; shift 2 ;;
+    --reviewer-poll-interval)
+      REVIEWER_POLL_INTERVAL="$2"; shift 2 ;;
     -h|--help)
       echo "Usage: ralph-review-loop.sh [OPTIONS]"
       echo ""
@@ -66,6 +75,9 @@ while [[ $# -gt 0 ]]; do
       echo "  --watch              Run continuously, polling for new PRs"
       echo "  --poll-interval SECS Seconds between polls in watch mode (default: 60)"
       echo "  --agents-dir PATH    Directory of agent .md files to use as reviewers"
+      echo "  --wait-for-reviewer USER   Wait for USER to review before Ralph reviews"
+      echo "  --reviewer-timeout SECS    Max wait for reviewer in one-shot mode (default: 600)"
+      echo "  --reviewer-poll-interval S Poll interval when waiting (default: 30)"
       echo "  -h, --help           Show this help message"
       echo ""
       echo "Examples:"
@@ -74,6 +86,7 @@ while [[ $# -gt 0 ]]; do
       echo "  ralph-review-loop.sh --watch --poll-interval 120  # check every 2 minutes"
       echo "  ralph-review-loop.sh --prs 5,6,7             # review specific PRs and exit"
       echo "  ralph-review-loop.sh --team-review --agents-dir ./agents  # custom agent reviewers"
+      echo "  ralph-review-loop.sh --watch --wait-for-reviewer \"devin-ai-integration[bot]\""
       exit 0
       ;;
     *)
@@ -98,6 +111,61 @@ mark_reviewed() {
   if ! is_reviewed "$pr_number"; then
     echo "$pr_number" >> "$REVIEWED_FILE"
   fi
+}
+
+# Check if a specific reviewer has submitted a review on a PR
+has_reviewer_reviewed() {
+  local pr_number="$1" reviewer="$2" repo_nwo="$3"
+  local count
+  count=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/reviews" \
+    --jq --arg user "$reviewer" \
+    '[.[] | select(.user.login == $user)] | length' 2>/dev/null || echo "0")
+  [[ "$count" -gt 0 ]]
+}
+
+# Fetch review comments from a specific reviewer
+get_reviewer_comments() {
+  local pr_number="$1" reviewer="$2" repo_nwo="$3"
+  local comments=""
+
+  # Get review-level summaries
+  local review_bodies
+  review_bodies=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/reviews" \
+    --jq --arg user "$reviewer" \
+    '[.[] | select(.user.login == $user) | .body | select(. != null and . != "")] | join("\n\n")' \
+    2>/dev/null || echo "")
+
+  # Get inline review comments (line-level findings on specific files)
+  local inline_comments
+  inline_comments=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/comments" \
+    --jq --arg user "$reviewer" \
+    '[.[] | select(.user.login == $user) | "File: \(.path), Line: \(.line // .original_line // "N/A")\n\(.body)"] | join("\n\n---\n\n")' \
+    2>/dev/null || echo "")
+
+  if [[ -n "$review_bodies" ]]; then
+    comments+="### Review Summary\n${review_bodies}\n\n"
+  fi
+  if [[ -n "$inline_comments" ]]; then
+    comments+="### Inline Comments\n${inline_comments}"
+  fi
+  echo -e "$comments"
+}
+
+# Wait for an external reviewer to submit their review (one-shot mode polling)
+wait_for_external_reviewer() {
+  local pr_number="$1"
+  [[ -z "$WAIT_FOR_REVIEWER" ]] && return 0
+  local start; start=$(date +%s)
+  while true; do
+    has_reviewer_reviewed "$pr_number" "$WAIT_FOR_REVIEWER" "$REPO_NWO" && return 0
+    local elapsed=$(( $(date +%s) - start ))
+    (( elapsed >= REVIEWER_WAIT_TIMEOUT )) && {
+      log "WARNING: Timed out waiting for ${WAIT_FOR_REVIEWER} on PR #${pr_number}"
+      return 1
+    }
+    log "PR #${pr_number}: waiting for ${WAIT_FOR_REVIEWER} (${elapsed}/${REVIEWER_WAIT_TIMEOUT}s)..."
+    sleep "$REVIEWER_POLL_INTERVAL"
+  done
 }
 
 # Graceful shutdown on SIGINT/SIGTERM
@@ -563,6 +631,7 @@ generate_review_team_prompt() {
   local pr_number="$1"
   local worktree_path="$2"
   local pr_branch="$3"
+  local reviewer_context="${4:-}"
 
   local worktree_section
   worktree_section=$(cat <<WTSECTION
@@ -627,6 +696,16 @@ You are running in a fully automated headless pipeline with NO human present.
 PROMPT
   else
     # ── Default: Cornelius solo code reviewer ─────────────────────────────
+    local reviewer_prompt_section=""
+    if [[ -n "$reviewer_context" ]]; then
+      reviewer_prompt_section="
+## External Review Feedback
+${WAIT_FOR_REVIEWER} has already reviewed this PR. Their feedback is below.
+Consider their comments in your review — address, fix, or acknowledge each point.
+
+${reviewer_context}
+"
+    fi
     cat <<PROMPT
 You are Cornelius, a meticulous and thorough code reviewer. You are reviewing PR #${pr_number}.
 
@@ -679,7 +758,7 @@ First ensure the label exists:
 
 Then create issues:
   \`gh issue create --title "<concise title>" --body "<description with context and PR #${pr_number} reference>" --label "review-followup"\`
-
+${reviewer_prompt_section}
 CRITICAL — HEADLESS AUTONOMY:
 You are running in a fully automated headless pipeline with NO human present.
 - NEVER ask for approval, confirmation, or permission for ANY action
@@ -701,6 +780,15 @@ review_pr() {
   pr_branch=$(gh pr view "$pr_number" --json headRefName -q .headRefName 2>/dev/null || echo "")
 
   log "Reviewing PR #${pr_number}: ${pr_title} (branch: ${pr_branch})"
+
+  # Fetch external reviewer's comments if configured
+  local reviewer_context=""
+  if [[ -n "$WAIT_FOR_REVIEWER" ]]; then
+    reviewer_context=$(get_reviewer_comments "$pr_number" "$WAIT_FOR_REVIEWER" "$REPO_NWO")
+    if [[ -n "$reviewer_context" ]]; then
+      log "Fetched review comments from ${WAIT_FOR_REVIEWER} for PR #${pr_number}"
+    fi
+  fi
 
   if [[ "$DRY_RUN" == true ]]; then
     if [[ "$TEAM_REVIEW" == true ]]; then
@@ -741,7 +829,7 @@ review_pr() {
     log "Dispatching Cornelius for PR review..."
 
     local review_prompt
-    review_prompt=$(generate_review_team_prompt "$pr_number" "$worktree_path" "$pr_branch")
+    review_prompt=$(generate_review_team_prompt "$pr_number" "$worktree_path" "$pr_branch" "$reviewer_context")
 
     # Detect review completion (merge, close, or approve) and give grace to wrap up
     export RALPH_DONE_PATTERN="gh pr merge|gh pr close|Approved by|--approve|successfully merged|pull request.*closed"
@@ -758,6 +846,17 @@ review_pr() {
     # ── Solo review ────────────────────────────────────────────────────
     export RALPH_DONE_PATTERN="gh pr merge|gh pr close|Approved by|--approve|successfully merged|pull request.*closed"
     export RALPH_DONE_GRACE=90
+
+    local reviewer_section=""
+    if [[ -n "$reviewer_context" ]]; then
+      reviewer_section="
+## External Review Feedback
+${WAIT_FOR_REVIEWER} has already reviewed this PR. Their feedback is below.
+Consider their comments in your review — address, fix, or acknowledge each point.
+
+${reviewer_context}
+"
+    fi
 
     run_claude -p "You are reviewing pull request #${pr_number} in this repository.
 
@@ -792,7 +891,7 @@ Do NOT use \`gh pr checkout\` — the branch is already checked out in the workt
 
 7. **If the PR is fundamentally broken** (can't be fixed reasonably):
    - \`gh pr close ${pr_number} --comment \"Closing: <explanation of why this PR is not mergeable>\"\`
-
+${reviewer_section}
 Always explain your reasoning before taking action.
 
 CRITICAL — HEADLESS AUTONOMY:
@@ -860,6 +959,13 @@ if [[ -n "$AGENTS_DIR" ]]; then
   fi
 fi
 
+# ── Resolve repo name for external reviewer checks ───────────────────────────
+REPO_NWO=""
+if [[ -n "$WAIT_FOR_REVIEWER" ]]; then
+  REPO_NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+  log "Will wait for '${WAIT_FOR_REVIEWER}' before reviewing (repo: ${REPO_NWO})"
+fi
+
 # ── Build PR queue from --prs if provided ────────────────────────────────────
 PR_QUEUE=()
 if [[ -n "$PR_LIST" ]]; then
@@ -873,7 +979,7 @@ fi
 
 if [[ "$WATCH" == true ]]; then
   # ── Watch mode: long-running daemon ──────────────────────────────────────
-  log "Ralph Review Loop starting in WATCH mode — poll=${POLL_INTERVAL}s, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, agents-dir=${AGENTS_DIR:-none}, dry-run=${DRY_RUN}"
+  log "Ralph Review Loop starting in WATCH mode — poll=${POLL_INTERVAL}s, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, agents-dir=${AGENTS_DIR:-none}, wait-for-reviewer=${WAIT_FOR_REVIEWER:-none}, dry-run=${DRY_RUN}"
   log "Tracking reviewed PRs in: ${REVIEWED_FILE}"
   log "Press Ctrl+C to stop gracefully."
 
@@ -892,6 +998,13 @@ if [[ "$WATCH" == true ]]; then
 
         if is_reviewed "$pr"; then
           continue
+        fi
+
+        if [[ -n "$WAIT_FOR_REVIEWER" ]]; then
+          if ! has_reviewer_reviewed "$pr" "$WAIT_FOR_REVIEWER" "$REPO_NWO"; then
+            log "PR #${pr}: waiting for ${WAIT_FOR_REVIEWER} — skipping this cycle"
+            continue
+          fi
         fi
 
         found_new=true
@@ -920,7 +1033,7 @@ if [[ "$WATCH" == true ]]; then
 
 else
   # ── One-shot mode: review specific PRs or N from queue ───────────────────
-  log "Ralph Review Loop starting — count=${COUNT}, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, agents-dir=${AGENTS_DIR:-none}, dry-run=${DRY_RUN}"
+  log "Ralph Review Loop starting — count=${COUNT}, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, agents-dir=${AGENTS_DIR:-none}, wait-for-reviewer=${WAIT_FOR_REVIEWER:-none}, dry-run=${DRY_RUN}"
   if [[ -n "$PR_LIST" ]]; then
     log "Explicit PR list: ${PR_LIST} (${#PR_QUEUE[@]} PRs)"
   fi
@@ -938,6 +1051,10 @@ else
       fi
       pr="${pr// /}"
       if [[ -n "$pr" ]]; then
+        if ! wait_for_external_reviewer "$pr"; then
+          log "Skipping PR #${pr} (reviewer timeout)"
+          continue
+        fi
         review_pr "$pr"
       else
         log "Empty PR number in list, skipping."
@@ -946,6 +1063,10 @@ else
       # Find oldest open PR
       pr=$(find_open_prs 1 | head -1)
       if [[ -n "$pr" ]]; then
+        if ! wait_for_external_reviewer "$pr"; then
+          log "Skipping PR #${pr} (reviewer timeout)"
+          continue
+        fi
         review_pr "$pr"
       else
         log "No open PRs found. Nothing to review."
