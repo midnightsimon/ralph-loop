@@ -894,7 +894,7 @@ Do NOT use \`gh pr checkout\` — the branch is already checked out in the workt
    - Then approve and merge (step 6)
 
 6. **If the PR is good** (either initially or after your fixes):
-   - \`gh pr review ${pr_number} --approve --body \"Looks good! Approved by Ralph.\"\`
+   - \`gh pr review ${pr_number} --approve --body \"Looks good! Reviewed and approved by Cornelius.\"\`
    - \`gh pr merge ${pr_number} --squash --delete-branch\`
 
 7. **If the PR is fundamentally broken** (can't be fixed reasonably):
