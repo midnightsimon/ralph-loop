@@ -116,10 +116,14 @@ mark_reviewed() {
 # Check if a specific reviewer has submitted a review on a PR
 has_reviewer_reviewed() {
   local pr_number="$1" reviewer="$2" repo_nwo="$3"
+  # Get the PR's current head SHA
+  local head_sha
+  head_sha=$(gh api "repos/${repo_nwo}/pulls/${pr_number}" -q '.head.sha' 2>/dev/null || echo "")
+  [[ -z "$head_sha" ]] && return 1
   local count
   count=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/reviews" 2>/dev/null \
-    | jq --arg user "$reviewer" \
-    '[.[] | select(.user.login == $user and .state != "PENDING")] | length' 2>/dev/null || echo "0")
+    | jq --arg user "$reviewer" --arg sha "$head_sha" \
+    '[.[] | select(.user.login == $user and (.state == "APPROVED" or .state == "CHANGES_REQUESTED") and .commit_id == $sha)] | length' 2>/dev/null || echo "0")
   [[ "$count" -gt 0 ]]
 }
 
@@ -132,7 +136,7 @@ get_reviewer_comments() {
   local review_state
   review_state=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/reviews" 2>/dev/null \
     | jq -r --arg user "$reviewer" \
-    '[.[] | select(.user.login == $user and .state != "PENDING")] | last | .state // "UNKNOWN"' \
+    '[.[] | select(.user.login == $user and (.state == "APPROVED" or .state == "CHANGES_REQUESTED"))] | last | .state // "UNKNOWN"' \
     2>/dev/null || echo "UNKNOWN")
   comments+="### Verdict: ${review_state}\n\n"
 
