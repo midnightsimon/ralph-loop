@@ -25,7 +25,7 @@ AGENT_NAMES=()
 AGENT_MODELS=()
 AGENT_COLORS=()
 AGENT_INSTRUCTIONS=()
-WAIT_FOR_REVIEWER=""          # GitHub login to wait for (e.g., "devin-ai-integration[bot]")
+WAIT_FOR_REVIEWER="devin-ai-integration[bot]"  # GitHub login to wait for before reviewing
 REVIEWER_WAIT_TIMEOUT=600    # max seconds to wait in one-shot mode (10 min)
 REVIEWER_POLL_INTERVAL=30    # seconds between API checks in one-shot mode
 
