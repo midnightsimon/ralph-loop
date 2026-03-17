@@ -123,7 +123,7 @@ has_reviewer_reviewed() {
   local count
   count=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/reviews" 2>/dev/null \
     | jq --arg user "$reviewer" --arg sha "$head_sha" \
-    '[.[] | select(.user.login == $user and (.state == "APPROVED" or .state == "CHANGES_REQUESTED") and .commit_id == $sha)] | length' 2>/dev/null || echo "0")
+    '[.[] | select(.user.login == $user and .state != "PENDING" and .state != "DISMISSED" and .commit_id == $sha)] | length' 2>/dev/null || echo "0")
   [[ "$count" -gt 0 ]]
 }
 
@@ -136,7 +136,7 @@ get_reviewer_comments() {
   local review_state
   review_state=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/reviews" 2>/dev/null \
     | jq -r --arg user "$reviewer" \
-    '[.[] | select(.user.login == $user and (.state == "APPROVED" or .state == "CHANGES_REQUESTED"))] | last | .state // "UNKNOWN"' \
+    '[.[] | select(.user.login == $user and .state != "PENDING" and .state != "DISMISSED")] | last | .state // "UNKNOWN"' \
     2>/dev/null || echo "UNKNOWN")
   comments+="### Verdict: ${review_state}\n\n"
 
