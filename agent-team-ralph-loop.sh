@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
-LOG_DIR="${REPO_ROOT}/.ralph-logs"
-SKIP_FILE="${REPO_ROOT}/.ralph-skip"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(pwd)"
+LOG_DIR="${PROJECT_DIR}/.ralph-logs"
+SKIP_FILE="${PROJECT_DIR}/.ralph-skip"
 LABEL_PRIORITY=("bug" "testing" "enhancement" "documentation")
 
 ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,Task,TaskCreate,TaskUpdate,TaskList,TaskGet,\
@@ -785,7 +786,7 @@ for s in starts:
   # Create worktree before invoking the team
   local feature_name
   feature_name=$(echo "$issue_title" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | cut -c1-50)
-  local worktree_path="${REPO_ROOT}/.worktrees/${feature_name}"
+  local worktree_path="${PROJECT_DIR}/.worktrees/${feature_name}"
 
   git fetch origin 2>/dev/null
 

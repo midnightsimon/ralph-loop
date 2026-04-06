@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
-LOG_DIR="${REPO_ROOT}/.ralph-logs"
-SKIP_FILE="${REPO_ROOT}/.ralph-skip"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(pwd)"
+LOG_DIR="${PROJECT_DIR}/.ralph-logs"
+SKIP_FILE="${PROJECT_DIR}/.ralph-skip"
 LABEL_PRIORITY=("bug" "testing" "enhancement" "documentation")
 
 ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,\
@@ -307,7 +308,9 @@ review_pr() {
 
 6. **If the PR is good** (either initially or after your fixes):
    - \`gh pr review ${pr_number} --approve --body \"Looks good! Approved by Ralph.\"\`
-   - \`gh pr merge ${pr_number} --squash --delete-branch\`
+   - Merge using the safe-merge wrapper (it verifies CI passes before merging):
+     \`${SCRIPT_DIR}/ralph-safe-merge.sh ${pr_number} --squash --delete-branch\`
+   - Do NOT use \`gh pr merge\` directly — always use ralph-safe-merge.sh
 
 7. **If the PR is fundamentally broken** (can't be fixed reasonably):
    - \`gh pr close ${pr_number} --comment \"Closing: <explanation of why this PR is not mergeable>\"\`
@@ -352,7 +355,7 @@ You are running in a fully automated headless pipeline with NO human present.
       # Also check .worktrees/ for a directory matching the branch suffix
       # (handles cases where git no longer tracks the worktree but the folder remains).
       # Use ## to strip the longest prefix up to '/', so feature/foo/bar → bar.
-      local wt_dir="${REPO_ROOT}/.worktrees/${pr_branch##*/}"
+      local wt_dir="${PROJECT_DIR}/.worktrees/${pr_branch##*/}"
       if [[ -d "$wt_dir" ]]; then
         log "Removing worktree directory: ${wt_dir}"
         git worktree remove "$wt_dir" --force 2>/dev/null || true
