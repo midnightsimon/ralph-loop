@@ -28,6 +28,9 @@ AGENT_INSTRUCTIONS=()
 WAIT_FOR_REVIEWER="devin-ai-integration[bot]"  # GitHub login to wait for before reviewing
 REVIEWER_WAIT_TIMEOUT=600    # max seconds to wait in one-shot mode (10 min)
 REVIEWER_POLL_INTERVAL=30    # seconds between API checks in one-shot mode
+SKIP_CI_CHECK=false          # set true to bypass CI check gate
+CI_CHECK_TIMEOUT=900         # max seconds to wait for CI checks (15 min)
+CI_CHECK_POLL_INTERVAL=30    # seconds between CI status polls
 
 # ── Parse CLI flags ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -58,6 +61,12 @@ while [[ $# -gt 0 ]]; do
       REVIEWER_WAIT_TIMEOUT="$2"; shift 2 ;;
     --reviewer-poll-interval)
       REVIEWER_POLL_INTERVAL="$2"; shift 2 ;;
+    --skip-ci-check)
+      SKIP_CI_CHECK=true; shift ;;
+    --ci-timeout)
+      CI_CHECK_TIMEOUT="$2"; shift 2 ;;
+    --ci-poll-interval)
+      CI_CHECK_POLL_INTERVAL="$2"; shift 2 ;;
     -h|--help)
       echo "Usage: ralph-review-loop.sh [OPTIONS]"
       echo ""
@@ -78,6 +87,9 @@ while [[ $# -gt 0 ]]; do
       echo "  --wait-for-reviewer USER   Wait for USER to review before Ralph reviews"
       echo "  --reviewer-timeout SECS    Max wait for reviewer in one-shot mode (default: 600)"
       echo "  --reviewer-poll-interval S Poll interval when waiting (default: 30)"
+      echo "  --skip-ci-check            Bypass CI check gate (merge even if checks fail)"
+      echo "  --ci-timeout SECS          Max wait for CI checks to complete (default: 900)"
+      echo "  --ci-poll-interval SECS    Poll interval for CI status checks (default: 30)"
       echo "  -h, --help           Show this help message"
       echo ""
       echo "Examples:"
@@ -177,6 +189,57 @@ wait_for_external_reviewer() {
     }
     log "PR #${pr_number}: waiting for ${WAIT_FOR_REVIEWER} (${elapsed}/${REVIEWER_WAIT_TIMEOUT}s)..."
     sleep "$REVIEWER_POLL_INTERVAL"
+  done
+}
+
+# Check CI status for a PR. Returns: 0=passed, 1=failed, 2=pending, 3=no checks
+get_ci_status() {
+  local pr_number="$1"
+  local checks_json
+  checks_json=$(gh pr checks "$pr_number" --json state,bucket,name 2>/dev/null || echo "")
+
+  [[ -z "$checks_json" || "$checks_json" == "[]" ]] && return 3
+
+  local fail_count pending_count
+  fail_count=$(echo "$checks_json" | jq '[.[] | select(.bucket == "fail")] | length')
+  pending_count=$(echo "$checks_json" | jq '[.[] | select(.bucket == "pending")] | length')
+
+  if [[ "$fail_count" -gt 0 ]]; then
+    return 1
+  elif [[ "$pending_count" -gt 0 ]]; then
+    return 2
+  else
+    return 0
+  fi
+}
+
+# Wait for CI checks to pass. Returns 0 on success/no-checks, 1 on failure/timeout.
+wait_for_ci_checks() {
+  local pr_number="$1"
+  [[ "$SKIP_CI_CHECK" == true ]] && return 0
+  local start; start=$(date +%s)
+  while true; do
+    get_ci_status "$pr_number"
+    local status=$?
+    case $status in
+      0) log "PR #${pr_number}: All CI checks passed"; return 0 ;;
+      1)
+        log "WARNING: PR #${pr_number}: CI checks FAILED"
+        gh pr checks "$pr_number" --json name,bucket,state 2>/dev/null \
+          | jq -r '.[] | select(.bucket == "fail") | "  FAIL: \(.name) (\(.state))"' \
+          | while IFS= read -r line; do log "$line"; done
+        return 1 ;;
+      3) log "PR #${pr_number}: No CI checks found — proceeding"; return 0 ;;
+      2)
+        local elapsed=$(( $(date +%s) - start ))
+        if (( elapsed >= CI_CHECK_TIMEOUT )); then
+          log "WARNING: Timed out waiting for CI checks on PR #${pr_number} after ${CI_CHECK_TIMEOUT}s"
+          return 1
+        fi
+        log "PR #${pr_number}: CI checks still running (${elapsed}/${CI_CHECK_TIMEOUT}s)..."
+        sleep "$CI_CHECK_POLL_INTERVAL"
+        ;;
+    esac
   done
 }
 
@@ -687,8 +750,11 @@ WTSECTION
    - Reading relevant source files in the worktree (${worktree_path}) for context
 3. After spawning ALL teammates, use \`TaskOutput\` with \`block: true\` to wait for each one's result
 4. Once you have all results, synthesize a decision:
-   - If fixable issues found: make fixes in the worktree (${worktree_path}), commit, push, then approve and merge
-   - If the PR is good: approve and merge with gh pr merge --squash --delete-branch
+   - FIRST: run \`gh pr checks ${pr_number}\` to verify all CI checks pass
+   - If CI checks are still running, use \`gh pr checks ${pr_number} --watch --fail-fast\` to wait
+   - If CI checks FAIL: do NOT merge. Comment on the PR with the failure details and stop
+   - If fixable issues found: make fixes in the worktree (${worktree_path}), commit, push, then wait for CI to re-run and pass (\`gh pr checks ${pr_number} --watch --fail-fast\`), then approve and merge
+   - If the PR is good and CI passes: approve and merge with gh pr merge --squash --delete-branch
    - If fundamentally broken: close with explanation
 
 IMPORTANT — SPAWNING PATTERN (you MUST follow this):
@@ -745,11 +811,18 @@ You work alone — do NOT spawn sub-agents, teams, or teammates. Review this PR 
    - Push: \`cd ${worktree_path} && git push origin ${pr_branch}\`
    - Then approve and merge (step 6)
 
-6. **If the PR is acceptable** (either initially or after your fixes):
+6. **Before merging, verify CI checks pass:**
+   - Run \`gh pr checks ${pr_number}\` to see the status of all CI checks
+   - If checks are still running, wait for them: \`gh pr checks ${pr_number} --watch --fail-fast\`
+   - If any checks FAIL: Do NOT merge. Leave a comment explaining which checks failed:
+     \`gh pr comment ${pr_number} --body "CI checks failed — not merging. Please fix the failing checks."\`
+   - Only proceed to merge if ALL checks pass (or if there are no CI checks configured)
+
+7. **If the PR is acceptable and CI checks pass** (either initially or after your fixes):
    - \`gh pr review ${pr_number} --approve --body "Reviewed and approved by Cornelius."\`
    - \`gh pr merge ${pr_number} --squash --delete-branch\`
 
-7. **If the PR is fundamentally broken** (can't be fixed reasonably):
+8. **If the PR is fundamentally broken** (can't be fixed reasonably):
    - \`gh pr close ${pr_number} --comment "Closing: <explanation>"\`
 
 ## Cleanup After Merge/Close
@@ -897,11 +970,18 @@ Do NOT use \`gh pr checkout\` — the branch is already checked out in the workt
    - Push the fixes: \`cd ${worktree_path} && git push origin ${pr_branch}\`
    - Then approve and merge (step 6)
 
-6. **If the PR is good** (either initially or after your fixes):
+6. **Before merging, verify CI checks pass:**
+   - Run \`gh pr checks ${pr_number}\` to see the status of all CI checks
+   - If checks are still running, wait for them: \`gh pr checks ${pr_number} --watch --fail-fast\`
+   - If any checks FAIL: Do NOT merge. Leave a comment explaining which checks failed:
+     \`gh pr comment ${pr_number} --body \"CI checks failed — not merging. Please fix the failing checks.\"\`
+   - Only proceed to merge if ALL checks pass (or if there are no CI checks configured)
+
+7. **If the PR is good and CI checks pass** (either initially or after your fixes):
    - \`gh pr review ${pr_number} --approve --body \"Looks good! Reviewed and approved by Cornelius.\"\`
    - \`gh pr merge ${pr_number} --squash --delete-branch\`
 
-7. **If the PR is fundamentally broken** (can't be fixed reasonably):
+8. **If the PR is fundamentally broken** (can't be fixed reasonably):
    - \`gh pr close ${pr_number} --comment \"Closing: <explanation of why this PR is not mergeable>\"\`
 ${reviewer_section}
 Always explain your reasoning before taking action.
@@ -991,7 +1071,7 @@ fi
 
 if [[ "$WATCH" == true ]]; then
   # ── Watch mode: long-running daemon ──────────────────────────────────────
-  log "Ralph Review Loop starting in WATCH mode — poll=${POLL_INTERVAL}s, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, agents-dir=${AGENTS_DIR:-none}, wait-for-reviewer=${WAIT_FOR_REVIEWER:-none}, dry-run=${DRY_RUN}"
+  log "Ralph Review Loop starting in WATCH mode — poll=${POLL_INTERVAL}s, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, agents-dir=${AGENTS_DIR:-none}, wait-for-reviewer=${WAIT_FOR_REVIEWER:-none}, skip-ci-check=${SKIP_CI_CHECK}, ci-timeout=${CI_CHECK_TIMEOUT}s, dry-run=${DRY_RUN}"
   log "Tracking reviewed PRs in: ${REVIEWED_FILE}"
   log "Press Ctrl+C to stop gracefully."
 
@@ -1017,6 +1097,11 @@ if [[ "$WATCH" == true ]]; then
             log "PR #${pr}: waiting for ${WAIT_FOR_REVIEWER} — skipping this cycle"
             continue
           fi
+        fi
+
+        if ! wait_for_ci_checks "$pr"; then
+          log "PR #${pr}: CI checks failed — skipping this cycle"
+          continue
         fi
 
         found_new=true
@@ -1045,7 +1130,7 @@ if [[ "$WATCH" == true ]]; then
 
 else
   # ── One-shot mode: review specific PRs or N from queue ───────────────────
-  log "Ralph Review Loop starting — count=${COUNT}, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, agents-dir=${AGENTS_DIR:-none}, wait-for-reviewer=${WAIT_FOR_REVIEWER:-none}, dry-run=${DRY_RUN}"
+  log "Ralph Review Loop starting — count=${COUNT}, model=${MODEL}, max-turns=${MAX_TURNS}, timeout=${TIMEOUT}s, team-review=${TEAM_REVIEW}, agents-dir=${AGENTS_DIR:-none}, wait-for-reviewer=${WAIT_FOR_REVIEWER:-none}, skip-ci-check=${SKIP_CI_CHECK}, ci-timeout=${CI_CHECK_TIMEOUT}s, dry-run=${DRY_RUN}"
   if [[ -n "$PR_LIST" ]]; then
     log "Explicit PR list: ${PR_LIST} (${#PR_QUEUE[@]} PRs)"
   fi
@@ -1067,6 +1152,10 @@ else
           log "Skipping PR #${pr} (reviewer timeout)"
           continue
         fi
+        if ! wait_for_ci_checks "$pr"; then
+          log "Skipping PR #${pr} (CI checks failed)"
+          continue
+        fi
         review_pr "$pr"
       else
         log "Empty PR number in list, skipping."
@@ -1077,6 +1166,10 @@ else
       if [[ -n "$pr" ]]; then
         if ! wait_for_external_reviewer "$pr"; then
           log "Skipping PR #${pr} (reviewer timeout)"
+          continue
+        fi
+        if ! wait_for_ci_checks "$pr"; then
+          log "Skipping PR #${pr} (CI checks failed)"
           continue
         fi
         review_pr "$pr"
