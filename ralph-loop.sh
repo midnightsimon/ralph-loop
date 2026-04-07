@@ -9,7 +9,8 @@ LABEL_PRIORITY=("bug" "testing" "enhancement" "documentation")
 
 ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,\
 Bash(git *),Bash(gh *),Bash(npm *),Bash(npx *),\
-Bash(cmake *),Bash(cd *),Bash(ls *),Bash(mkdir *),Bash(rm *)"
+Bash(cmake *),Bash(cd *),Bash(ls *),Bash(mkdir *),Bash(rm *),\
+Bash(*/ralph-safe-merge.sh *)"
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 COUNT=1

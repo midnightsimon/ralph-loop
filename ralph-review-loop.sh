@@ -8,7 +8,8 @@ REVIEWED_FILE="${PROJECT_DIR}/.ralph-reviewed-prs"
 
 ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,Task,TaskCreate,TaskUpdate,TaskList,TaskGet,\
 Bash(git *),Bash(gh *),Bash(npm *),Bash(npx *),\
-Bash(cmake *),Bash(cd *),Bash(ls *),Bash(mkdir *),Bash(rm *)"
+Bash(cmake *),Bash(cd *),Bash(ls *),Bash(mkdir *),Bash(rm *),\
+Bash(*/ralph-safe-merge.sh *)"
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 COUNT=1
@@ -1152,7 +1153,6 @@ if [[ "$WATCH" == true ]]; then
         fi
 
         # Check retry count before reviewing
-        local retries
         retries=$(get_retry_count "$pr")
         if (( retries >= MAX_REVIEW_RETRIES )); then
           log "PR #${pr}: exceeded max retries (${retries}/${MAX_REVIEW_RETRIES}) — giving up"
@@ -1166,13 +1166,11 @@ if [[ "$WATCH" == true ]]; then
         review_pr "$pr"
 
         # Only mark as reviewed if PR was merged or closed; otherwise retry next cycle
-        local post_state
         post_state=$(gh pr view "$pr" --json state -q .state 2>/dev/null || echo "OPEN")
         if [[ "$post_state" == "MERGED" || "$post_state" == "CLOSED" ]]; then
           mark_reviewed "$pr"
           clear_retry_count "$pr"
         else
-          local new_count
           new_count=$(increment_retry_count "$pr")
           log "PR #${pr}: still open after review (retry ${new_count}/${MAX_REVIEW_RETRIES}) — will retry next cycle"
         fi
