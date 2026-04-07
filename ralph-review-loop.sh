@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
-LOG_DIR="${REPO_ROOT}/.ralph-logs"
-REVIEWED_FILE="${REPO_ROOT}/.ralph-reviewed-prs"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(pwd)"
+LOG_DIR="${PROJECT_DIR}/.ralph-logs"
+REVIEWED_FILE="${PROJECT_DIR}/.ralph-reviewed-prs"
 
 ALLOWED_TOOLS="Read,Edit,Write,Grep,Glob,Task,TaskCreate,TaskUpdate,TaskList,TaskGet,\
 Bash(git *),Bash(gh *),Bash(npm *),Bash(npx *),\
-Bash(cmake *),Bash(cd *),Bash(ls *),Bash(mkdir *),Bash(rm *)"
+Bash(cmake *),Bash(cd *),Bash(ls *),Bash(mkdir *),Bash(rm *),\
+Bash(*/ralph-safe-merge.sh *)"
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 COUNT=1
@@ -122,6 +124,45 @@ mark_reviewed() {
   local pr_number="$1"
   if ! is_reviewed "$pr_number"; then
     echo "$pr_number" >> "$REVIEWED_FILE"
+  fi
+}
+
+# ── Retry tracking for PRs that fail CI after review ──────────────────────────
+MAX_REVIEW_RETRIES="${MAX_REVIEW_RETRIES:-3}"
+
+get_retry_count() {
+  local pr_number="$1"
+  local retry_file="${PROJECT_DIR}/.ralph-retry-counts"
+  if [[ -f "$retry_file" ]]; then
+    local count
+    count=$(grep "^${pr_number}:" "$retry_file" 2>/dev/null | tail -1 | cut -d: -f2)
+    echo "${count:-0}"
+  else
+    echo "0"
+  fi
+}
+
+increment_retry_count() {
+  local pr_number="$1"
+  local retry_file="${PROJECT_DIR}/.ralph-retry-counts"
+  local current
+  current=$(get_retry_count "$pr_number")
+  local new_count=$((current + 1))
+  # Remove old entry and add updated one
+  if [[ -f "$retry_file" ]]; then
+    grep -v "^${pr_number}:" "$retry_file" > "${retry_file}.tmp" 2>/dev/null || true
+    mv "${retry_file}.tmp" "$retry_file"
+  fi
+  echo "${pr_number}:${new_count}" >> "$retry_file"
+  echo "$new_count"
+}
+
+clear_retry_count() {
+  local pr_number="$1"
+  local retry_file="${PROJECT_DIR}/.ralph-retry-counts"
+  if [[ -f "$retry_file" ]]; then
+    grep -v "^${pr_number}:" "$retry_file" > "${retry_file}.tmp" 2>/dev/null || true
+    mv "${retry_file}.tmp" "$retry_file"
   fi
 }
 
@@ -750,11 +791,12 @@ WTSECTION
    - Reading relevant source files in the worktree (${worktree_path}) for context
 3. After spawning ALL teammates, use \`TaskOutput\` with \`block: true\` to wait for each one's result
 4. Once you have all results, synthesize a decision:
-   - FIRST: run \`gh pr checks ${pr_number}\` to verify all CI checks pass
-   - If CI checks are still running, use \`gh pr checks ${pr_number} --watch --fail-fast\` to wait
-   - If CI checks FAIL: do NOT merge. Comment on the PR with the failure details and stop
    - If fixable issues found: make fixes in the worktree (${worktree_path}), commit, push, then wait for CI to re-run and pass (\`gh pr checks ${pr_number} --watch --fail-fast\`), then approve and merge
-   - If the PR is good and CI passes: approve and merge with gh pr merge --squash --delete-branch
+   - If the PR is good: approve and merge using the safe-merge wrapper (it verifies CI before merging):
+     \`gh pr review ${pr_number} --approve\` then \`${SCRIPT_DIR}/ralph-safe-merge.sh ${pr_number} --squash --delete-branch\`
+   - Do NOT use \`gh pr merge\` directly — always use ralph-safe-merge.sh
+   - If the safe-merge wrapper reports CI failure: read the errors, attempt to fix them in the worktree, commit, push, wait for CI (\`gh pr checks ${pr_number} --watch --fail-fast\`), then retry the merge
+   - If you cannot fix the CI errors, leave a comment explaining what failed and stop
    - If fundamentally broken: close with explanation
 
 IMPORTANT — SPAWNING PATTERN (you MUST follow this):
@@ -811,16 +853,19 @@ You work alone — do NOT spawn sub-agents, teams, or teammates. Review this PR 
    - Push: \`cd ${worktree_path} && git push origin ${pr_branch}\`
    - Then approve and merge (step 6)
 
-6. **Before merging, verify CI checks pass:**
-   - Run \`gh pr checks ${pr_number}\` to see the status of all CI checks
-   - If checks are still running, wait for them: \`gh pr checks ${pr_number} --watch --fail-fast\`
-   - If any checks FAIL: Do NOT merge. Leave a comment explaining which checks failed:
-     \`gh pr comment ${pr_number} --body "CI checks failed — not merging. Please fix the failing checks."\`
-   - Only proceed to merge if ALL checks pass (or if there are no CI checks configured)
-
-7. **If the PR is acceptable and CI checks pass** (either initially or after your fixes):
+6. **If the PR is acceptable** (either initially or after your fixes):
    - \`gh pr review ${pr_number} --approve --body "Reviewed and approved by Cornelius."\`
-   - \`gh pr merge ${pr_number} --squash --delete-branch\`
+   - Merge using the safe-merge wrapper (it verifies CI passes before merging):
+     \`${SCRIPT_DIR}/ralph-safe-merge.sh ${pr_number} --squash --delete-branch\`
+   - Do NOT use \`gh pr merge\` directly — always use ralph-safe-merge.sh
+
+7. **If the safe-merge wrapper reports CI failure:**
+   - Read the failing check output to understand what failed (e.g. typecheck, lint, tests)
+   - Attempt to fix the errors in the worktree: \`cd ${worktree_path} && ...\`
+   - Commit and push: \`cd ${worktree_path} && git add . && git commit -m "fix: ..." && git push origin ${pr_branch}\`
+   - Wait for CI to re-run: \`gh pr checks ${pr_number} --watch --fail-fast\`
+   - Try merging again: \`${SCRIPT_DIR}/ralph-safe-merge.sh ${pr_number} --squash --delete-branch\`
+   - If you cannot fix the errors, leave a comment explaining what failed and stop
 
 8. **If the PR is fundamentally broken** (can't be fixed reasonably):
    - \`gh pr close ${pr_number} --comment "Closing: <explanation>"\`
@@ -887,8 +932,8 @@ review_pr() {
   fi
 
   # ── Create a worktree so we don't touch the main working tree ──────
-  mkdir -p "${REPO_ROOT}/.worktrees"
-  local worktree_path="${REPO_ROOT}/.worktrees/review-pr-${pr_number}"
+  mkdir -p "${PROJECT_DIR}/.worktrees"
+  local worktree_path="${PROJECT_DIR}/.worktrees/review-pr-${pr_number}"
 
   # Fetch the PR branch so it's available locally
   git fetch origin "pull/${pr_number}/head:${pr_branch}" 2>/dev/null || \
@@ -917,7 +962,7 @@ review_pr() {
     review_prompt=$(generate_review_team_prompt "$pr_number" "$worktree_path" "$pr_branch" "$reviewer_context")
 
     # Detect review completion (merge, close, or approve) and give grace to wrap up
-    export RALPH_DONE_PATTERN="gh pr merge|gh pr close|Approved by|--approve|successfully merged|pull request.*closed"
+    export RALPH_DONE_PATTERN="gh pr merge|ralph-safe-merge|gh pr close|Approved by|--approve|successfully merged|pull request.*closed|CI FAILED.*blocking merge|CI checks failed"
     export RALPH_DONE_GRACE=120
 
     run_claude -p "$review_prompt" \
@@ -929,7 +974,7 @@ review_pr() {
     unset RALPH_DONE_PATTERN RALPH_DONE_GRACE
   else
     # ── Solo review ────────────────────────────────────────────────────
-    export RALPH_DONE_PATTERN="gh pr merge|gh pr close|Approved by|--approve|successfully merged|pull request.*closed"
+    export RALPH_DONE_PATTERN="gh pr merge|ralph-safe-merge|gh pr close|Approved by|--approve|successfully merged|pull request.*closed|CI FAILED.*blocking merge|CI checks failed"
     export RALPH_DONE_GRACE=90
 
     local reviewer_section=""
@@ -970,16 +1015,19 @@ Do NOT use \`gh pr checkout\` — the branch is already checked out in the workt
    - Push the fixes: \`cd ${worktree_path} && git push origin ${pr_branch}\`
    - Then approve and merge (step 6)
 
-6. **Before merging, verify CI checks pass:**
-   - Run \`gh pr checks ${pr_number}\` to see the status of all CI checks
-   - If checks are still running, wait for them: \`gh pr checks ${pr_number} --watch --fail-fast\`
-   - If any checks FAIL: Do NOT merge. Leave a comment explaining which checks failed:
-     \`gh pr comment ${pr_number} --body \"CI checks failed — not merging. Please fix the failing checks.\"\`
-   - Only proceed to merge if ALL checks pass (or if there are no CI checks configured)
-
-7. **If the PR is good and CI checks pass** (either initially or after your fixes):
+6. **If the PR is good** (either initially or after your fixes):
    - \`gh pr review ${pr_number} --approve --body \"Looks good! Reviewed and approved by Cornelius.\"\`
-   - \`gh pr merge ${pr_number} --squash --delete-branch\`
+   - Merge using the safe-merge wrapper (it verifies CI passes before merging):
+     \`${SCRIPT_DIR}/ralph-safe-merge.sh ${pr_number} --squash --delete-branch\`
+   - Do NOT use \`gh pr merge\` directly — always use ralph-safe-merge.sh
+
+7. **If the safe-merge wrapper reports CI failure:**
+   - Read the failing check output to understand what failed (e.g. typecheck, lint, tests)
+   - Attempt to fix the errors in the worktree: \`cd ${worktree_path} && ...\`
+   - Commit and push: \`cd ${worktree_path} && git add . && git commit -m \"fix: ...\" && git push origin ${pr_branch}\`
+   - Wait for CI to re-run: \`gh pr checks ${pr_number} --watch --fail-fast\`
+   - Try merging again: \`${SCRIPT_DIR}/ralph-safe-merge.sh ${pr_number} --squash --delete-branch\`
+   - If you cannot fix the errors, leave a comment explaining what failed and stop
 
 8. **If the PR is fundamentally broken** (can't be fixed reasonably):
    - \`gh pr close ${pr_number} --comment \"Closing: <explanation of why this PR is not mergeable>\"\`
@@ -1104,11 +1152,28 @@ if [[ "$WATCH" == true ]]; then
           continue
         fi
 
+        # Check retry count before reviewing
+        retries=$(get_retry_count "$pr")
+        if (( retries >= MAX_REVIEW_RETRIES )); then
+          log "PR #${pr}: exceeded max retries (${retries}/${MAX_REVIEW_RETRIES}) — giving up"
+          mark_reviewed "$pr"
+          continue
+        fi
+
         found_new=true
         reviews_done=$((reviews_done + 1))
         log "── Review #${reviews_done} (PR #${pr}) ──────────────────────────────────────"
         review_pr "$pr"
-        mark_reviewed "$pr"
+
+        # Only mark as reviewed if PR was merged or closed; otherwise retry next cycle
+        post_state=$(gh pr view "$pr" --json state -q .state 2>/dev/null || echo "OPEN")
+        if [[ "$post_state" == "MERGED" || "$post_state" == "CLOSED" ]]; then
+          mark_reviewed "$pr"
+          clear_retry_count "$pr"
+        else
+          new_count=$(increment_retry_count "$pr")
+          log "PR #${pr}: still open after review (retry ${new_count}/${MAX_REVIEW_RETRIES}) — will retry next cycle"
+        fi
       done
 
       if [[ "$found_new" == false ]]; then

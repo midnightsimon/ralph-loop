@@ -33,15 +33,20 @@
 
   Setup
 
-  1. Copy ralph-loop.sh into the root of your GitHub repository.
-  2. Make it executable:
-  chmod +x ralph-loop.sh
-  3. Ensure your repo has a CLAUDE.md at the root — Claude uses it to
-  understand your project structure, conventions, and workflow.
+  1. Clone this repo (or put it anywhere on your machine):
+  git clone <repo-url> ~/ralph-loop
+  2. Ensure your target project has a CLAUDE.md at its root — Claude
+  uses it to understand your project structure, conventions, and
+  workflow.
+  3. Run the scripts from your project directory:
+  cd ~/my-project && ~/ralph-loop/ralph-loop.sh
+
+  No need to copy scripts into each project. The scripts auto-detect
+  the project from your current working directory.
 
   Usage
 
-  ./ralph-loop.sh [OPTIONS]
+  ralph-loop.sh [OPTIONS]
 
   Options
 
@@ -81,19 +86,19 @@
   Examples
 
   # Work one issue (auto-picks highest priority)
-  ./ralph-loop.sh
+  cd ~/my-project && ~/ralph-loop/ralph-loop.sh
 
   # Work 5 iterations (reviews PRs + picks issues)
-  ./ralph-loop.sh --count 5
+  ~/ralph-loop/ralph-loop.sh --count 5
 
   # Work on specific issues
-  ./ralph-loop.sh --issues 42,58,73
+  ~/ralph-loop/ralph-loop.sh --issues 42,58,73
 
   # Only work bug-labeled issues, using sonnet
-  ./ralph-loop.sh --label bug --model sonnet --count 3
+  ~/ralph-loop/ralph-loop.sh --label bug --model sonnet --count 3
 
   # Preview what would happen
-  ./ralph-loop.sh --count 3 --dry-run
+  ~/ralph-loop/ralph-loop.sh --count 3 --dry-run
 
   Issue Priority
 
@@ -108,6 +113,48 @@
   Issues that are already assigned are skipped. Issues that fail or hit
    max turns are added to .ralph-skip so they won't be retried.
 
+  Review Loop (ralph-review-loop.sh)
+
+  A dedicated PR review loop that watches for open PRs and reviews
+  them automatically. Supports watch mode (continuous polling) and
+  one-shot mode.
+
+  cd ~/my-project && ~/ralph-loop/ralph-review-loop.sh --watch
+  cd ~/my-project && ~/ralph-loop/ralph-review-loop.sh --prs 42,58
+
+  Key features:
+  - CI-gated merges: PRs are only merged after all CI checks pass.
+    Merges go through ralph-safe-merge.sh, which programmatically
+    verifies CI status before executing the merge.
+  - Auto-fix CI failures: If CI fails after review (e.g. typecheck
+    errors), Claude attempts to fix the errors, push, and retry.
+  - Retry on failure: If a PR can't be merged (CI still failing),
+    it's retried on the next poll cycle, up to 3 times (configurable
+    via MAX_REVIEW_RETRIES env var). After max retries, the PR is
+    skipped.
+  - Team review mode: Use --team-review to have multiple AI
+    reviewers examine the PR independently before a lead synthesizes
+    a decision.
+  - External reviewer gating: Use --wait-for-reviewer NAME to wait
+    for a human/bot review before Ralph reviews.
+
+  Safe Merge (ralph-safe-merge.sh)
+
+  A standalone merge wrapper that enforces CI checks at merge time.
+  Used by the review loop internally, but can also be called
+  directly:
+
+  ~/ralph-loop/ralph-safe-merge.sh 123 --squash --delete-branch
+
+  Behavior:
+  - Checks gh pr checks for failures before merging
+  - If checks are pending, polls every 15s (up to 5 min, configurable
+    via RALPH_MERGE_CI_TIMEOUT env var)
+  - If checks fail, prints which checks failed and exits 1
+  - If checks pass, merges with --auto flag for server-side
+    enforcement
+  - If no CI checks are configured, proceeds with the merge
+
   How It Works Internally
 
   - Tool sandboxing: Claude is restricted to a specific set of allowed
@@ -118,9 +165,21 @@
   the configured timeout.
   - Max turns detection: If Claude hits the turn limit, the issue is
   added to the skip file.
+  - Directory separation: SCRIPT_DIR (where ralph scripts live) and
+  PROJECT_DIR (your current working directory) are tracked
+  separately, so the scripts work from any project without copying.
+  - CI-gated merging: All merges go through ralph-safe-merge.sh,
+  which checks CI status programmatically — not just via prompt
+  instructions to Claude.
+  - Retry tracking (.ralph-retry-counts): Tracks how many times a PR
+  has been retried after failed reviews. Cleared on successful
+  merge/close.
   - Skip file (.ralph-skip): A newline-delimited list of issue numbers
   that Ralph won't retry. Delete the file or remove entries to
   re-enable them.
+  - Reviewed PRs (.ralph-reviewed-prs): Tracks which PRs have been
+  reviewed. PRs are only marked as reviewed after they are merged or
+  closed — not just after a review attempt.
   - Logs (.ralph-logs/): Every Claude invocation's stdout/stderr is
   saved with a timestamp for debugging.
   - Worktree cleanup: After merging a PR, Ralph automatically removes
