@@ -935,21 +935,27 @@ review_pr() {
   mkdir -p "${PROJECT_DIR}/.worktrees"
   local worktree_path="${PROJECT_DIR}/.worktrees/review-pr-${pr_number}"
 
+  # Clean up stale worktree entries before creating new ones
+  git worktree prune 2>/dev/null || true
+
+  # If directory exists from a previous failed run, remove it
+  if [[ -d "$worktree_path" ]]; then
+    git worktree remove "$worktree_path" --force 2>/dev/null || true
+    [[ -d "$worktree_path" ]] && rm -rf "$worktree_path"
+  fi
+
   # Fetch the PR branch so it's available locally
-  git fetch origin "pull/${pr_number}/head:${pr_branch}" 2>/dev/null || \
+  git fetch origin "pull/${pr_number}/head:pr-review-${pr_number}" 2>/dev/null || \
     git fetch origin "${pr_branch}" 2>/dev/null || true
 
-  if [[ -d "$worktree_path" ]]; then
-    log "Reusing existing review worktree: ${worktree_path}"
-  else
-    git worktree add "$worktree_path" "$pr_branch" 2>/dev/null || {
-      log "Failed to create review worktree for PR #${pr_number} — falling back to detached HEAD"
-      git worktree add --detach "$worktree_path" "$pr_branch" 2>/dev/null || {
-        log "ERROR: Could not create worktree at all for PR #${pr_number}"
-        return 1
-      }
+  # Create worktree using the fetched ref (detached to avoid "already checked out" errors)
+  local wt_error
+  wt_error=$(git worktree add --detach "$worktree_path" "pr-review-${pr_number}" 2>&1) || \
+    wt_error=$(git worktree add --detach "$worktree_path" "origin/${pr_branch}" 2>&1) || \
+    wt_error=$(git worktree add --detach "$worktree_path" "${pr_branch}" 2>&1) || {
+      log "ERROR: Could not create worktree for PR #${pr_number}: ${wt_error}"
+      return 1
     }
-  fi
   log "Review worktree ready: ${worktree_path}"
 
   local review_rc=0
