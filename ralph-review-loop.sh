@@ -173,11 +173,24 @@ has_reviewer_reviewed() {
   local head_sha
   head_sha=$(gh api "repos/${repo_nwo}/pulls/${pr_number}" -q '.head.sha' 2>/dev/null || echo "")
   [[ -z "$head_sha" ]] && return 1
+
+  # Check 1: PR review submitted (on any commit — Devin may have reviewed an
+  # earlier push, and that's sufficient to unblock our review)
   local count
   count=$(gh api "repos/${repo_nwo}/pulls/${pr_number}/reviews" 2>/dev/null \
-    | jq --arg user "$reviewer" --arg sha "$head_sha" \
-    '[.[] | select(.user.login == $user and .state != "PENDING" and .state != "DISMISSED" and .commit_id == $sha)] | length' 2>/dev/null || echo "0")
-  [[ "$count" -gt 0 ]]
+    | jq --arg user "$reviewer" \
+    '[.[] | select(.user.login == $user and .state != "PENDING" and .state != "DISMISSED")] | length' 2>/dev/null || echo "0")
+  [[ "$count" -gt 0 ]] && return 0
+
+  # Check 2: Completed check run from the reviewer's app (fallback for bots
+  # like devin-ai-integration[bot] that sometimes signal via check runs
+  # instead of PR reviews)
+  local app_slug="${reviewer%%\[bot\]}"
+  local check_count
+  check_count=$(gh api "repos/${repo_nwo}/commits/${head_sha}/check-runs" 2>/dev/null \
+    | jq --arg app "$app_slug" \
+    '[.check_runs[] | select(.app.slug == $app and .status == "completed" and .conclusion == "success")] | length' 2>/dev/null || echo "0")
+  [[ "$check_count" -gt 0 ]]
 }
 
 # Fetch review comments from a specific reviewer
