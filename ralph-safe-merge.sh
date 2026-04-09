@@ -29,9 +29,22 @@ get_ci_status() {
     return 1
   elif [[ "$pending_count" -gt 0 ]]; then
     return 2
-  else
-    return 0
   fi
+
+  # Guard against jobs that haven't been created as check runs yet
+  # (e.g., workflow jobs with `needs:` dependencies still waiting to be queued).
+  local head_sha
+  head_sha=$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid 2>/dev/null || echo "")
+  if [[ -n "$head_sha" ]]; then
+    local running
+    running=$(gh run list --commit "$head_sha" --json status \
+      -q '[.[] | select(.status == "in_progress" or .status == "queued")] | length' 2>/dev/null || echo "0")
+    if [[ "$running" -gt 0 ]]; then
+      return 2  # treat as pending
+    fi
+  fi
+
+  return 0
 }
 
 print_failed_checks() {

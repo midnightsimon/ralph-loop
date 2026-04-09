@@ -249,12 +249,25 @@ get_ci_status() {
     return 1
   elif [[ "$pending_count" -gt 0 ]]; then
     return 2
-  else
-    return 0
   fi
+
+  # Guard against jobs that haven't been created as check runs yet
+  # (e.g., workflow jobs with `needs:` dependencies still waiting to be queued).
+  local head_sha
+  head_sha=$(gh pr view "$pr_number" --json headRefOid -q .headRefOid 2>/dev/null || echo "")
+  if [[ -n "$head_sha" ]]; then
+    local running
+    running=$(gh run list --commit "$head_sha" --json status \
+      -q '[.[] | select(.status == "in_progress" or .status == "queued")] | length' 2>/dev/null || echo "0")
+    if [[ "$running" -gt 0 ]]; then
+      return 2  # treat as pending
+    fi
+  fi
+
+  return 0
 }
 
-# Wait for CI checks to pass. Returns 0 on success/no-checks, 1 on failure/timeout.
+# Wait for CI checks to complete. Returns: 0=passed/no-checks, 1=timed out, 2=failed.
 wait_for_ci_checks() {
   local pr_number="$1"
   [[ "$SKIP_CI_CHECK" == true ]] && return 0
@@ -269,7 +282,7 @@ wait_for_ci_checks() {
         gh pr checks "$pr_number" --json name,bucket,state 2>/dev/null \
           | jq -r '.[] | select(.bucket == "fail") | "  FAIL: \(.name) (\(.state))"' \
           | while IFS= read -r line; do log "$line"; done
-        return 1 ;;
+        return 2 ;;
       3) log "PR #${pr_number}: No CI checks found — proceeding"; return 0 ;;
       2)
         local elapsed=$(( $(date +%s) - start ))
@@ -282,6 +295,13 @@ wait_for_ci_checks() {
         ;;
     esac
   done
+}
+
+# Get a human-readable summary of failed CI checks (for passing into Claude prompt).
+get_failed_checks_summary() {
+  local pr_number="$1"
+  gh pr checks "$pr_number" --json name,bucket,state 2>/dev/null \
+    | jq -r '.[] | select(.bucket == "fail") | "  FAIL: \(.name) (\(.state))"'
 }
 
 # Graceful shutdown on SIGINT/SIGTERM
@@ -748,6 +768,28 @@ generate_review_team_prompt() {
   local worktree_path="$2"
   local pr_branch="$3"
   local reviewer_context="${4:-}"
+  local ci_failure_context="${5:-}"
+
+  local ci_preamble=""
+  if [[ -n "$ci_failure_context" ]]; then
+    read -r -d '' ci_preamble <<CIPREAMBLE || true
+
+## CI Failures (Pre-existing)
+
+CI checks are FAILING on this PR before your review. The following checks failed:
+
+${ci_failure_context}
+
+Your FIRST priority is to diagnose and fix these CI failures:
+1. Read the failing check logs: \`gh pr checks ${pr_number}\` and inspect the output
+2. Identify the root cause in the code within the worktree (${worktree_path})
+3. Fix the issues, commit, and push:
+   \`cd ${worktree_path} && git add . && git commit -m "fix: ..." && git push origin ${pr_branch}\`
+4. Wait for CI to re-run: \`gh pr checks ${pr_number} --watch --fail-fast\`
+5. If CI passes, proceed with your normal review below
+6. If the failures are MAJOR and UNFIXABLE (infrastructure issue, fundamental design flaw, massive scope requiring architectural changes) — leave a PR comment explaining what failed and why it can't be auto-fixed, then stop
+CIPREAMBLE
+  fi
 
   local worktree_section
   worktree_section=$(cat <<WTSECTION
@@ -765,6 +807,7 @@ WTSECTION
     echo "You are the team lead for reviewing PR #${pr_number}."
     echo ""
     echo "${worktree_section}"
+    [[ -n "$ci_preamble" ]] && echo "$ci_preamble"
     echo ""
     echo "## Teammates to Spawn"
     echo ""
@@ -795,6 +838,7 @@ WTSECTION
    - If the PR is good: approve and merge using the safe-merge wrapper (it verifies CI before merging):
      \`gh pr review ${pr_number} --approve\` then \`${SCRIPT_DIR}/ralph-safe-merge.sh ${pr_number} --squash --delete-branch\`
    - Do NOT use \`gh pr merge\` directly — always use ralph-safe-merge.sh
+   - If there are merge conflicts: rebase onto main (\`cd ${worktree_path} && git fetch origin main && git rebase origin/main\`), resolve small conflicts, force-push (\`git push origin ${pr_branch} --force-with-lease\`), wait for CI, then retry merge. If conflicts are major (many files, ambiguous), leave a comment and stop
    - If the safe-merge wrapper reports CI failure: read the errors, attempt to fix them in the worktree, commit, push, wait for CI (\`gh pr checks ${pr_number} --watch --fail-fast\`), then retry the merge
    - If you cannot fix the CI errors, leave a comment explaining what failed and stop
    - If fundamentally broken: close with explanation
@@ -830,6 +874,7 @@ ${reviewer_context}
 You are Cornelius, a meticulous and thorough code reviewer. You are reviewing PR #${pr_number}.
 
 ${worktree_section}
+${ci_preamble}
 
 ## Review Process
 
@@ -859,7 +904,18 @@ You work alone — do NOT spawn sub-agents, teams, or teammates. Review this PR 
      \`${SCRIPT_DIR}/ralph-safe-merge.sh ${pr_number} --squash --delete-branch\`
    - Do NOT use \`gh pr merge\` directly — always use ralph-safe-merge.sh
 
-7. **If the safe-merge wrapper reports CI failure:**
+7. **If there are merge conflicts** (merge blocked by conflicts with the base branch):
+   - Fetch and rebase onto the base branch from the worktree:
+     \`cd ${worktree_path} && git fetch origin main && git rebase origin/main\`
+   - If the conflicts are SMALL (a few files, clear resolution): resolve them, then:
+     \`cd ${worktree_path} && git add . && git rebase --continue\`
+   - Force-push the rebased branch:
+     \`cd ${worktree_path} && git push origin ${pr_branch} --force-with-lease\`
+   - Wait for CI to re-run: \`gh pr checks ${pr_number} --watch --fail-fast\`
+   - Then retry the merge (step 6)
+   - If the conflicts are MAJOR (many files, ambiguous resolution, semantic conflicts) — leave a PR comment explaining the conflicts and stop
+
+8. **If the safe-merge wrapper reports CI failure:**
    - Read the failing check output to understand what failed (e.g. typecheck, lint, tests)
    - Attempt to fix the errors in the worktree: \`cd ${worktree_path} && ...\`
    - Commit and push: \`cd ${worktree_path} && git add . && git commit -m "fix: ..." && git push origin ${pr_branch}\`
@@ -867,7 +923,7 @@ You work alone — do NOT spawn sub-agents, teams, or teammates. Review this PR 
    - Try merging again: \`${SCRIPT_DIR}/ralph-safe-merge.sh ${pr_number} --squash --delete-branch\`
    - If you cannot fix the errors, leave a comment explaining what failed and stop
 
-8. **If the PR is fundamentally broken** (can't be fixed reasonably):
+9. **If the PR is fundamentally broken** (can't be fixed reasonably):
    - \`gh pr close ${pr_number} --comment "Closing: <explanation>"\`
 
 ## Cleanup After Merge/Close
@@ -905,6 +961,7 @@ PROMPT
 
 review_pr() {
   local pr_number="$1"
+  local ci_failure_context="${2:-}"
   local pr_title pr_branch
   pr_title=$(gh pr view "$pr_number" --json title -q .title)
   pr_branch=$(gh pr view "$pr_number" --json headRefName -q .headRefName 2>/dev/null || echo "")
@@ -965,7 +1022,7 @@ review_pr() {
     log "Dispatching Cornelius for PR review..."
 
     local review_prompt
-    review_prompt=$(generate_review_team_prompt "$pr_number" "$worktree_path" "$pr_branch" "$reviewer_context")
+    review_prompt=$(generate_review_team_prompt "$pr_number" "$worktree_path" "$pr_branch" "$reviewer_context" "$ci_failure_context")
 
     # Detect review completion (merge, close, or approve) and give grace to wrap up
     export RALPH_DONE_PATTERN="gh pr merge|ralph-safe-merge|gh pr close|Approved by|--approve|successfully merged|pull request.*closed|CI FAILED.*blocking merge|CI checks failed"
@@ -994,6 +1051,26 @@ ${reviewer_context}
 "
     fi
 
+    local solo_ci_preamble=""
+    if [[ -n "$ci_failure_context" ]]; then
+      solo_ci_preamble="
+## CI Failures (Pre-existing)
+
+CI checks are FAILING on this PR before your review. The following checks failed:
+
+${ci_failure_context}
+
+Your FIRST priority is to diagnose and fix these CI failures:
+1. Read the failing check logs: \`gh pr checks ${pr_number}\` and inspect the output
+2. Identify the root cause in the code within the worktree (${worktree_path})
+3. Fix the issues, commit, and push:
+   \`cd ${worktree_path} && git add . && git commit -m \"fix: ...\" && git push origin ${pr_branch}\`
+4. Wait for CI to re-run: \`gh pr checks ${pr_number} --watch --fail-fast\`
+5. If CI passes, proceed with your normal review below
+6. If the failures are MAJOR and UNFIXABLE (infrastructure issue, fundamental design flaw, massive scope requiring architectural changes) — leave a PR comment explaining what failed and why it can't be auto-fixed, then stop
+"
+    fi
+
     run_claude -p "You are reviewing pull request #${pr_number} in this repository.
 
 ## Worktree
@@ -1001,7 +1078,7 @@ A git worktree has been created for this PR at: ${worktree_path}
 Branch: ${pr_branch}
 All code reading and fixes MUST happen in this worktree directory.
 Do NOT use \`gh pr checkout\` — the branch is already checked out in the worktree.
-
+${solo_ci_preamble}
 ## Instructions
 
 1. Run \`gh pr view ${pr_number}\` to read the PR description.
@@ -1027,7 +1104,18 @@ Do NOT use \`gh pr checkout\` — the branch is already checked out in the workt
      \`${SCRIPT_DIR}/ralph-safe-merge.sh ${pr_number} --squash --delete-branch\`
    - Do NOT use \`gh pr merge\` directly — always use ralph-safe-merge.sh
 
-7. **If the safe-merge wrapper reports CI failure:**
+7. **If there are merge conflicts** (merge blocked by conflicts with the base branch):
+   - Fetch and rebase onto the base branch from the worktree:
+     \`cd ${worktree_path} && git fetch origin main && git rebase origin/main\`
+   - If the conflicts are SMALL (a few files, clear resolution): resolve them, then:
+     \`cd ${worktree_path} && git add . && git rebase --continue\`
+   - Force-push the rebased branch:
+     \`cd ${worktree_path} && git push origin ${pr_branch} --force-with-lease\`
+   - Wait for CI to re-run: \`gh pr checks ${pr_number} --watch --fail-fast\`
+   - Then retry the merge (step 6)
+   - If the conflicts are MAJOR (many files, ambiguous resolution, semantic conflicts) — leave a PR comment explaining the conflicts and stop
+
+8. **If the safe-merge wrapper reports CI failure:**
    - Read the failing check output to understand what failed (e.g. typecheck, lint, tests)
    - Attempt to fix the errors in the worktree: \`cd ${worktree_path} && ...\`
    - Commit and push: \`cd ${worktree_path} && git add . && git commit -m \"fix: ...\" && git push origin ${pr_branch}\`
@@ -1035,7 +1123,7 @@ Do NOT use \`gh pr checkout\` — the branch is already checked out in the workt
    - Try merging again: \`${SCRIPT_DIR}/ralph-safe-merge.sh ${pr_number} --squash --delete-branch\`
    - If you cannot fix the errors, leave a comment explaining what failed and stop
 
-8. **If the PR is fundamentally broken** (can't be fixed reasonably):
+9. **If the PR is fundamentally broken** (can't be fixed reasonably):
    - \`gh pr close ${pr_number} --comment \"Closing: <explanation of why this PR is not mergeable>\"\`
 ${reviewer_section}
 Always explain your reasoning before taking action.
@@ -1153,9 +1241,16 @@ if [[ "$WATCH" == true ]]; then
           fi
         fi
 
-        if ! wait_for_ci_checks "$pr"; then
-          log "PR #${pr}: CI checks failed — skipping this cycle"
+        ci_result=0
+        wait_for_ci_checks "$pr" || ci_result=$?
+        if [[ $ci_result -eq 1 ]]; then
+          log "PR #${pr}: CI checks timed out — skipping this cycle"
           continue
+        fi
+        ci_failed=""
+        if [[ $ci_result -eq 2 ]]; then
+          ci_failed=$(get_failed_checks_summary "$pr")
+          log "PR #${pr}: CI failed — proceeding to review for potential fix"
         fi
 
         # Check retry count before reviewing
@@ -1169,7 +1264,7 @@ if [[ "$WATCH" == true ]]; then
         found_new=true
         reviews_done=$((reviews_done + 1))
         log "── Review #${reviews_done} (PR #${pr}) ──────────────────────────────────────"
-        review_pr "$pr"
+        review_pr "$pr" "$ci_failed"
 
         # Only mark as reviewed if PR was merged or closed; otherwise retry next cycle
         post_state=$(gh pr view "$pr" --json state -q .state 2>/dev/null || echo "OPEN")
@@ -1223,11 +1318,18 @@ else
           log "Skipping PR #${pr} (reviewer timeout)"
           continue
         fi
-        if ! wait_for_ci_checks "$pr"; then
-          log "Skipping PR #${pr} (CI checks failed)"
+        ci_result=0
+        wait_for_ci_checks "$pr" || ci_result=$?
+        if [[ $ci_result -eq 1 ]]; then
+          log "Skipping PR #${pr} (CI checks timed out)"
           continue
         fi
-        review_pr "$pr"
+        ci_failed=""
+        if [[ $ci_result -eq 2 ]]; then
+          ci_failed=$(get_failed_checks_summary "$pr")
+          log "PR #${pr}: CI failed — proceeding to review for potential fix"
+        fi
+        review_pr "$pr" "$ci_failed"
       else
         log "Empty PR number in list, skipping."
       fi
@@ -1239,11 +1341,18 @@ else
           log "Skipping PR #${pr} (reviewer timeout)"
           continue
         fi
-        if ! wait_for_ci_checks "$pr"; then
-          log "Skipping PR #${pr} (CI checks failed)"
+        ci_result=0
+        wait_for_ci_checks "$pr" || ci_result=$?
+        if [[ $ci_result -eq 1 ]]; then
+          log "Skipping PR #${pr} (CI checks timed out)"
           continue
         fi
-        review_pr "$pr"
+        ci_failed=""
+        if [[ $ci_result -eq 2 ]]; then
+          ci_failed=$(get_failed_checks_summary "$pr")
+          log "PR #${pr}: CI failed — proceeding to review for potential fix"
+        fi
+        review_pr "$pr" "$ci_failed"
       else
         log "No open PRs found. Nothing to review."
       fi
